@@ -56,6 +56,7 @@ func (c *HTTPClient) startGrokVideo(_ context.Context, input Request) (*Response
 	}
 	c.videoMu.Lock()
 	c.videoJobs[job.ID] = job
+	body, _ := json.Marshal(job.public())
 	c.videoMu.Unlock()
 
 	jobContext, cancel := context.WithTimeout(c.config.BackgroundContext, c.config.VideoTimeout)
@@ -68,7 +69,6 @@ func (c *HTTPClient) startGrokVideo(_ context.Context, input Request) (*Response
 			c.videoMu.Unlock()
 		})
 	}()
-	body, _ := json.Marshal(job.public())
 	return &Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
 }
 
