@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: grok_go
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d grok_go"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      GROK_GO_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/grok_go?sslmode=disable
+      GROK_GO_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm --dir web install --frozen-lockfile
+      - name: Frontend checks
+        run: |
+          pnpm --dir web lint
+          pnpm --dir web test
+          pnpm --dir web build
+      - name: Install Playwright Chromium
+        run: pnpm --dir web exec playwright install --with-deps chromium
+      - name: Browser checks
+        run: pnpm --dir web test:e2e
+      - shell: pwsh
+        run: ./scripts/build-web.ps1
+      - name: Go checks
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p bin
+          version="${GITHUB_REF_NAME}"
+          commit="${GITHUB_SHA}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X github.com/langrenjh-alt/GROK-GO/internal/buildinfo.Version=${version} -X github.com/langrenjh-alt/GROK-GO/internal/buildinfo.Commit=${commit} -X github.com/langrenjh-alt/GROK-GO/internal/buildinfo.Date=${build_date}"
+          go build -trimpath -ldflags "$ldflags" -o bin/grok-go-linux-amd64 ./cmd/grok-go
+          cd bin
+          sha256sum grok-go-linux-amd64 > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            bin/grok-go-linux-amd64
+            bin/checksums.txt

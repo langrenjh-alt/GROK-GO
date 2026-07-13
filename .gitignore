@@ -1,0 +1,33 @@
+# Go
+/bin/
+/coverage/
+*.test
+*.out
+
+# Frontend
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/tsconfig.tsbuildinfo
+/web/test-results/
+/web/playwright-report/
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep
+
+# Runtime
+**/.env
+**/.env.*
+!**/.env.example
+/data/
+/logs/
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

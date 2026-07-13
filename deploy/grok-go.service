@@ -1,0 +1,22 @@
+[Unit]
+Description=GROK-GO API gateway
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grok-go
+Group=grok-go
+EnvironmentFile=/etc/grok-go/grok-go.env
+ExecStart=/usr/local/bin/grok-go
+WorkingDirectory=/var/lib/grok-go
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/grok-go
+
+[Install]
+WantedBy=multi-user.target

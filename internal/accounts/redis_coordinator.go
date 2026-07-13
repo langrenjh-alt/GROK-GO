@@ -1,0 +1,262 @@
+package accounts
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/langrenjh-alt/GROK-GO/internal/database"
+)
+
+const defaultCoordinatorNamespace = "account-pool"
+
+// Coordinator keeps account scheduling state consistent across processes.
+type Coordinator interface {
+	AcquireLease(context.Context, string, int, time.Duration) (CoordinationLease, bool, error)
+	ReleaseLease(context.Context, CoordinationLease) error
+	GetAffinity(context.Context, string, string) (string, bool, error)
+	BindAffinity(context.Context, string, string, string, time.Duration) (string, error)
+	ClearAffinity(context.Context, string, string, string) error
+	CooldownUntil(context.Context, string) (time.Time, bool, error)
+	SetCooldown(context.Context, string, time.Time) error
+	ClearCooldown(context.Context, string) error
+}
+
+// CoordinationLease identifies one Redis-owned concurrency slot.
+type CoordinationLease struct {
+	AccountID string
+	Slot      int
+	Owner     string
+}
+
+// RedisCommands is implemented by database.Redis. The complete common command
+// surface is retained here so alternate Redis adapters can be injected without
+// exposing a concrete client to the account pool.
+type RedisCommands interface {
+	Get(context.Context, string) ([]byte, error)
+	Set(context.Context, string, []byte, time.Duration) error
+	SetNX(context.Context, string, []byte, time.Duration) (bool, error)
+	GetDelete(context.Context, string) ([]byte, bool, error)
+	AcquireSlot(context.Context, string, int, time.Duration) (bool, error)
+	ReleaseSlot(context.Context, string) error
+	CompareDelete(context.Context, string, []byte) (bool, error)
+}
+
+// RedisCoordinator uses owner-specific slot keys instead of a shared counter.
+// This makes lease release idempotent and prevents a stale owner from releasing
+// a slot that has already been acquired by another process.
+type RedisCoordinator struct {
+	redis     RedisCommands
+	namespace string
+	now       func() time.Time
+	random    func([]byte) (int, error)
+}
+
+var (
+	_ RedisCommands = (*database.Redis)(nil)
+	_ Coordinator   = (*RedisCoordinator)(nil)
+)
+
+func NewRedisCoordinator(redis RedisCommands) *RedisCoordinator {
+	return NewRedisCoordinatorWithNamespace(redis, defaultCoordinatorNamespace)
+}
+
+func NewRedisCoordinatorWithNamespace(redis RedisCommands, namespace string) *RedisCoordinator {
+	namespace = strings.Trim(namespace, ":")
+	if namespace == "" {
+		namespace = defaultCoordinatorNamespace
+	}
+	return &RedisCoordinator{
+		redis:     redis,
+		namespace: namespace,
+		now:       time.Now,
+		random:    rand.Read,
+	}
+}
+
+func (c *RedisCoordinator) AcquireLease(ctx context.Context, accountID string, limit int, ttl time.Duration) (CoordinationLease, bool, error) {
+	if c == nil || c.redis == nil {
+		return CoordinationLease{}, false, errors.New("account coordinator is not configured")
+	}
+	if accountID == "" {
+		return CoordinationLease{}, false, errors.New("account lease requires an account ID")
+	}
+	if limit <= 0 {
+		return CoordinationLease{}, false, errors.New("account lease limit must be positive")
+	}
+	if ttl <= 0 {
+		return CoordinationLease{}, false, errors.New("account lease TTL must be positive")
+	}
+
+	ownerBytes := make([]byte, 16)
+	if _, err := c.random(ownerBytes); err != nil {
+		return CoordinationLease{}, false, fmt.Errorf("create account lease owner: %w", err)
+	}
+	owner := hex.EncodeToString(ownerBytes)
+	for slot := 0; slot < limit; slot++ {
+		acquired, err := c.redis.SetNX(ctx, c.leaseKey(accountID, slot), []byte(owner), ttl)
+		if err != nil {
+			return CoordinationLease{}, false, fmt.Errorf("acquire account lease: %w", err)
+		}
+		if acquired {
+			return CoordinationLease{AccountID: accountID, Slot: slot, Owner: owner}, true, nil
+		}
+	}
+	return CoordinationLease{}, false, nil
+}
+
+func (c *RedisCoordinator) ReleaseLease(ctx context.Context, lease CoordinationLease) error {
+	if c == nil || c.redis == nil {
+		return errors.New("account coordinator is not configured")
+	}
+	if lease.AccountID == "" || lease.Slot < 0 || lease.Owner == "" {
+		return errors.New("invalid account coordination lease")
+	}
+	_, err := c.redis.CompareDelete(ctx, c.leaseKey(lease.AccountID, lease.Slot), []byte(lease.Owner))
+	if err != nil {
+		return fmt.Errorf("release account lease: %w", err)
+	}
+	return nil
+}
+
+func (c *RedisCoordinator) GetAffinity(ctx context.Context, model, affinity string) (string, bool, error) {
+	if c == nil || c.redis == nil {
+		return "", false, errors.New("account coordinator is not configured")
+	}
+	value, err := c.redis.Get(ctx, c.affinityKey(model, affinity))
+	if errors.Is(err, database.ErrCacheMiss) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read account affinity: %w", err)
+	}
+	if len(value) == 0 {
+		return "", false, errors.New("account affinity is empty")
+	}
+	return string(value), true, nil
+}
+
+// BindAffinity atomically creates a mapping and returns the winning account ID
+// when another process created the same mapping concurrently.
+func (c *RedisCoordinator) BindAffinity(ctx context.Context, model, affinity, accountID string, ttl time.Duration) (string, error) {
+	if c == nil || c.redis == nil {
+		return "", errors.New("account coordinator is not configured")
+	}
+	if accountID == "" {
+		return "", errors.New("account affinity requires an account ID")
+	}
+	if ttl <= 0 {
+		return "", errors.New("account affinity TTL must be positive")
+	}
+	key := c.affinityKey(model, affinity)
+	for attempt := 0; attempt < 3; attempt++ {
+		created, err := c.redis.SetNX(ctx, key, []byte(accountID), ttl)
+		if err != nil {
+			return "", fmt.Errorf("bind account affinity: %w", err)
+		}
+		if created {
+			return accountID, nil
+		}
+		value, err := c.redis.Get(ctx, key)
+		if errors.Is(err, database.ErrCacheMiss) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("read bound account affinity: %w", err)
+		}
+		if len(value) == 0 {
+			return "", errors.New("bound account affinity is empty")
+		}
+		return string(value), nil
+	}
+	return "", errors.New("account affinity changed while binding")
+}
+
+func (c *RedisCoordinator) ClearAffinity(ctx context.Context, model, affinity, accountID string) error {
+	if c == nil || c.redis == nil {
+		return errors.New("account coordinator is not configured")
+	}
+	if accountID == "" {
+		return errors.New("account affinity requires an account ID")
+	}
+	if _, err := c.redis.CompareDelete(ctx, c.affinityKey(model, affinity), []byte(accountID)); err != nil {
+		return fmt.Errorf("clear account affinity: %w", err)
+	}
+	return nil
+}
+
+func (c *RedisCoordinator) CooldownUntil(ctx context.Context, accountID string) (time.Time, bool, error) {
+	if c == nil || c.redis == nil {
+		return time.Time{}, false, errors.New("account coordinator is not configured")
+	}
+	value, err := c.redis.Get(ctx, c.cooldownKey(accountID))
+	if errors.Is(err, database.ErrCacheMiss) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("read account cooldown: %w", err)
+	}
+	nanos, err := strconv.ParseInt(string(value), 10, 64)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse account cooldown: %w", err)
+	}
+	until := time.Unix(0, nanos)
+	if !until.After(c.now()) {
+		return time.Time{}, false, nil
+	}
+	return until, true, nil
+}
+
+func (c *RedisCoordinator) SetCooldown(ctx context.Context, accountID string, until time.Time) error {
+	if c == nil || c.redis == nil {
+		return errors.New("account coordinator is not configured")
+	}
+	if accountID == "" {
+		return errors.New("account cooldown requires an account ID")
+	}
+	ttl := until.Sub(c.now())
+	if ttl <= 0 {
+		return nil
+	}
+	value := []byte(strconv.FormatInt(until.UnixNano(), 10))
+	if err := c.redis.Set(ctx, c.cooldownKey(accountID), value, ttl); err != nil {
+		return fmt.Errorf("set account cooldown: %w", err)
+	}
+	return nil
+}
+
+func (c *RedisCoordinator) ClearCooldown(ctx context.Context, accountID string) error {
+	if c == nil || c.redis == nil {
+		return errors.New("account coordinator is not configured")
+	}
+	if accountID == "" {
+		return errors.New("account cooldown requires an account ID")
+	}
+	if _, _, err := c.redis.GetDelete(ctx, c.cooldownKey(accountID)); err != nil {
+		return fmt.Errorf("clear account cooldown: %w", err)
+	}
+	return nil
+}
+
+func (c *RedisCoordinator) leaseKey(accountID string, slot int) string {
+	return fmt.Sprintf("%s:lease:%s:%d", c.namespace, digest(accountID), slot)
+}
+
+func (c *RedisCoordinator) affinityKey(model, affinity string) string {
+	return c.namespace + ":affinity:" + digest(model+"\x00"+affinity)
+}
+
+func (c *RedisCoordinator) cooldownKey(accountID string) string {
+	return c.namespace + ":cooldown:" + digest(accountID)
+}
+
+func digest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}

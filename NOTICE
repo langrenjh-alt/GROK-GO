@@ -1,0 +1,12 @@
+GROK-GO
+
+This project is an independent Go implementation informed by the public API
+behavior and operational concepts of these projects:
+
+- langrenjh-alt/grok2api-haochi (MIT)
+- Wei-Shaw/sub2api (LGPL-3.0)
+- geist-org/geist-ui (MIT), consulted only as historical design-system reference
+
+No source code from sub2api is included. Vercel Geist documentation is used as
+the visual and interaction specification; GROK-GO's UI components are original
+local implementations.

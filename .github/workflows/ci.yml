@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: grok_go
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d grok_go"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      GROK_GO_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/grok_go?sslmode=disable
+      GROK_GO_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Frontend checks
+        run: |
+          pnpm --dir web lint
+          pnpm --dir web test
+          pnpm --dir web build
+      - name: Install Playwright Chromium
+        run: pnpm --dir web exec playwright install --with-deps chromium
+      - name: Browser checks
+        run: pnpm --dir web test:e2e
+      - name: Stage embedded frontend
+        shell: pwsh
+        run: ./scripts/build-web.ps1
+
+      - name: Go formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Go vet
+        run: go vet ./...
+      - name: Go tests
+        run: go test -race ./...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Verify static Linux build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -o /tmp/grok-go ./cmd/grok-go
+      - name: Verify single-file startup
+        env:
+          GROK_GO_LISTEN_ADDR: 127.0.0.1:18080
+          GROK_GO_PUBLIC_URL: http://127.0.0.1:18080
+          GROK_GO_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/grok_go?sslmode=disable
+          GROK_GO_REDIS_URL: redis://127.0.0.1:6379/0
+          GROK_GO_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+          GROK_GO_BOOTSTRAP_TOKEN: ci-bootstrap-token
+          GROK_GO_DATA_DIR: /tmp/grok-go-data
+        run: |
+          /tmp/grok-go >/tmp/grok-go.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:18080/readyz && break
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/readyz | grep '"status":"ready"'
+          curl --fail --silent http://127.0.0.1:18080/login/ | grep '<!DOCTYPE html>'
