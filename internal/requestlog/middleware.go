@@ -65,6 +65,13 @@ func (m Middleware) Handler(next http.Handler) http.Handler {
 			UsageParsed:  completion.UsageParsed,
 			CreatedAt:    started.UTC(),
 		}
+		if completion.CacheIdentityApplied {
+			entry.Metadata, _ = json.Marshal(map[string]bool{
+				"cache_identity_applied":     true,
+				"cache_affinity_reused":      completion.CacheAffinityReused,
+				"cache_affinity_established": completion.CacheAffinityEstablished,
+			})
+		}
 		if statusCode >= http.StatusBadRequest {
 			entry.ErrorCode = errorCode
 			if entry.ErrorCode == "" {

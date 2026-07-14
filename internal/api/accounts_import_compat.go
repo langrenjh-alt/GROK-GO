@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +29,9 @@ func parseInteroperableAccountEnvelope(data []byte, object map[string]json.RawMe
 		var nested map[string]json.RawMessage
 		if json.Unmarshal(wrapped, &nested) == nil {
 			if result, matched, err := parseInteroperableAccountEnvelope(wrapped, nested); matched || err != nil {
+				if err == nil {
+					applyWrappedImportControls(&result, object)
+				}
 				return result, matched, err
 			}
 		}
@@ -48,6 +53,22 @@ func parseInteroperableAccountEnvelope(data []byte, object map[string]json.RawMe
 		return result, true, err
 	}
 	return importRequest{}, false, nil
+}
+
+func applyWrappedImportControls(result *importRequest, object map[string]json.RawMessage) {
+	if result == nil {
+		return
+	}
+	if value := rawString(object["initial_status"]); strings.TrimSpace(value) != "" {
+		result.InitialStatus = domain.AccountStatus(value)
+		result.Status = ""
+	} else if value := rawString(object["status"]); strings.TrimSpace(value) != "" {
+		result.InitialStatus = domain.AccountStatus(value)
+		result.Status = ""
+	}
+	if value := rawString(object["post_import_action"]); strings.TrimSpace(value) != "" {
+		result.PostImportAction = value
+	}
 }
 
 func parseNativeAccountEnvelope(data []byte) (importRequest, error) {
@@ -172,7 +193,13 @@ func credentialsFromMap(values map[string]any) (domain.Credentials, error) {
 	if len(values) == 0 {
 		return domain.Credentials{}, errors.New("sub2api Grok account has no credentials")
 	}
-	encoded, err := json.Marshal(values)
+	copyValues := make(map[string]any, len(values))
+	for key, value := range values {
+		copyValues[key] = value
+	}
+	expiresAtValue, hasExpiresAt := copyValues["expires_at"]
+	delete(copyValues, "expires_at")
+	encoded, err := json.Marshal(copyValues)
 	if err != nil {
 		return domain.Credentials{}, errors.New("sub2api Grok credentials have an invalid schema")
 	}
@@ -180,7 +207,65 @@ func credentialsFromMap(values map[string]any) (domain.Credentials, error) {
 	if err := json.Unmarshal(encoded, &credentials); err != nil {
 		return domain.Credentials{}, errors.New("sub2api Grok credentials have an invalid schema")
 	}
+	if hasExpiresAt && expiresAtValue != nil {
+		expiresAt, err := parseSub2APICredentialExpiry(expiresAtValue)
+		if err != nil {
+			return domain.Credentials{}, err
+		}
+		credentials.ExpiresAt = expiresAt
+	}
 	return credentials, nil
+}
+
+func parseSub2APICredentialExpiry(value any) (time.Time, error) {
+	invalid := func() (time.Time, error) {
+		return time.Time{}, errors.New("sub2api Grok credentials have an invalid expiration time")
+	}
+	switch value := value.(type) {
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return time.Time{}, nil
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			return parsed.UTC(), nil
+		}
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds < 0 {
+			return invalid()
+		}
+		return time.Unix(seconds, 0).UTC(), nil
+	case json.Number:
+		if seconds, err := value.Int64(); err == nil && seconds >= 0 {
+			return time.Unix(seconds, 0).UTC(), nil
+		}
+		parsed, err := value.Float64()
+		if err != nil {
+			return invalid()
+		}
+		value = json.Number(strconv.FormatFloat(parsed, 'f', -1, 64))
+		return parseSub2APICredentialExpiry(string(value))
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value >= math.Exp2(63) || math.Trunc(value) != value {
+			return invalid()
+		}
+		return time.Unix(int64(value), 0).UTC(), nil
+	case float32:
+		return parseSub2APICredentialExpiry(float64(value))
+	case int:
+		return parseSub2APICredentialExpiry(int64(value))
+	case int64:
+		if value < 0 {
+			return invalid()
+		}
+		return time.Unix(value, 0).UTC(), nil
+	case int32:
+		return parseSub2APICredentialExpiry(int64(value))
+	case time.Time:
+		return value.UTC(), nil
+	default:
+		return invalid()
+	}
 }
 
 func decodeGrokGoMetadata(extra map[string]any) (grokGoInteropMetadata, bool, error) {

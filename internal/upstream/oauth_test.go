@@ -220,6 +220,162 @@ func TestRefreshServiceConcurrentManualRefreshReusesRotatedCredentials(t *testin
 	}
 }
 
+func TestRefreshAccountForProbeKeepsRefreshedAccountOutOfScheduling(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600})
+	}))
+	defer server.Close()
+
+	store := newBarrierCredentialStore(domain.Credentials{AccessToken: "old-access", RefreshToken: "old-refresh"}, 1)
+	store.setAccountState(domain.AccountCooldown, timePointer(time.Now().Add(time.Hour)), "previous refresh failure")
+	var callbacks atomic.Int32
+	service := &RefreshService{
+		OAuth:             NewOAuthService(OAuthConfig{TokenURL: server.URL, ClientID: "client"}, server.Client()),
+		Store:             store,
+		OnAccountsChanged: func(context.Context) { callbacks.Add(1) },
+	}
+
+	credentials, err := service.RefreshAccountForProbe(context.Background(), "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials.AccessToken != "new-access" || credentials.RefreshToken != "new-refresh" {
+		t.Fatalf("unexpected refreshed credentials: %#v", credentials)
+	}
+	update := store.refreshUpdate()
+	if update.Credentials == nil || update.Credentials.AccessToken != "new-access" {
+		t.Fatalf("refreshed credentials were not saved: %#v", update)
+	}
+	if update.Status != domain.AccountError || update.CooldownUntil != nil || update.LastError != "" {
+		t.Fatalf("account was not held for its health probe: %#v", update)
+	}
+	if callbacks.Load() != 1 {
+		t.Fatalf("account-change callbacks = %d, want 1", callbacks.Load())
+	}
+}
+
+func TestRefreshAccountForProbeFailureKeepsVerificationHold(t *testing.T) {
+	now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if refreshCalls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"unexpected-access","refresh_token":"unexpected-refresh","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	store := newBarrierCredentialStore(domain.Credentials{
+		AccessToken: "old-access", RefreshToken: "old-refresh", ExpiresAt: now.Add(30 * time.Minute),
+	}, 1)
+	store.setAccountState(domain.AccountError, nil, "post-import verification pending")
+	service := &RefreshService{
+		OAuth: NewOAuthService(OAuthConfig{TokenURL: server.URL, ClientID: "client"}, server.Client()),
+		Store: store, Now: func() time.Time { return now },
+	}
+
+	if _, err := service.RefreshAccountForProbe(context.Background(), "account"); err == nil {
+		t.Fatal("failed refresh returned no error")
+	}
+	update := store.refreshUpdate()
+	if update.Status != domain.AccountError || update.CooldownUntil != nil || update.LastError == "" {
+		t.Fatalf("failed probe refresh released the verification hold: %#v", update)
+	}
+
+	if err := service.RefreshDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if account := store.accountState(); account.Status != domain.AccountError || account.CooldownUntil != nil {
+		t.Fatalf("background refresh promoted an unverified account: %#v", account)
+	}
+	if store.saveCount() != 1 || refreshCalls.Load() != 1 {
+		t.Fatalf("state saves = %d, refresh calls = %d, want 1/1", store.saveCount(), refreshCalls.Load())
+	}
+}
+
+func TestRefreshAccountForProbePreservesHoldAfterAnotherInstanceRotatesCredentials(t *testing.T) {
+	var refreshes atomic.Int32
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var requestStartedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshes.Add(1)
+		requestStartedOnce.Do(func() { close(requestStarted) })
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600})
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case <-releaseRequest:
+		default:
+			close(releaseRequest)
+		}
+	}()
+
+	store := newBarrierCredentialStore(domain.Credentials{AccessToken: "old-access", RefreshToken: "old-refresh"}, 1)
+	coordinator := newMemoryCoordinator()
+	var callbacks atomic.Int32
+	service := &RefreshService{
+		OAuth: NewOAuthService(OAuthConfig{TokenURL: server.URL, ClientID: "client"}, server.Client()),
+		Store: store, Locks: coordinator, LockTTL: time.Minute,
+		OnAccountsChanged: func(context.Context) { callbacks.Add(1) },
+	}
+
+	ordinaryResult := make(chan domain.Credentials, 1)
+	ordinaryErr := make(chan error, 1)
+	go func() {
+		credentials, err := service.RefreshAccount(context.Background(), "account")
+		ordinaryResult <- credentials
+		ordinaryErr <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ordinary refresh did not reach the token endpoint")
+	}
+
+	probeResult := make(chan domain.Credentials, 1)
+	probeErr := make(chan error, 1)
+	go func() {
+		credentials, err := service.RefreshAccountForProbe(context.Background(), "account")
+		probeResult <- credentials
+		probeErr <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.reads.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if store.reads.Load() < 3 {
+		t.Fatal("probe refresh did not load the pre-rotation credentials")
+	}
+	close(releaseRequest)
+
+	if err := <-ordinaryErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-probeErr; err != nil {
+		t.Fatal(err)
+	}
+	for _, credentials := range []domain.Credentials{<-ordinaryResult, <-probeResult} {
+		if credentials.AccessToken != "new-access" || credentials.RefreshToken != "new-refresh" {
+			t.Fatalf("unexpected refreshed credentials: %#v", credentials)
+		}
+	}
+	if refreshes.Load() != 1 || store.saveCount() != 2 || callbacks.Load() != 2 {
+		t.Fatalf("refreshes=%d saves=%d callbacks=%d, want 1/2/2", refreshes.Load(), store.saveCount(), callbacks.Load())
+	}
+	update := store.refreshUpdate()
+	if update.Credentials != nil || update.Status != domain.AccountError || update.CooldownUntil != nil || update.LastError != "" {
+		t.Fatalf("lock waiter did not preserve the probe hold: %#v", update)
+	}
+}
+
 func TestRefreshDueUsesCredentialExpiryBoundaryAndCooldown(t *testing.T) {
 	now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
 	tests := []struct {

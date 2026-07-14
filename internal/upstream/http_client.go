@@ -135,6 +135,7 @@ func (c *HTTPClient) Do(ctx context.Context, input Request) (*Response, error) {
 	if err := adapter.Apply(request, input.Credentials); err != nil {
 		return nil, err
 	}
+	applyPromptCacheHeader(request.Header, input)
 
 	client := c.client
 	if strings.TrimSpace(input.ProxyURL) != "" {
@@ -176,6 +177,22 @@ func (c *HTTPClient) Do(ctx context.Context, input Request) (*Response, error) {
 	result.Body = body
 	result.Events = Events(parseNonStreamWithToolNames(body, reverseToolNames)...)
 	return result, nil
+}
+
+// applyPromptCacheHeader keeps xAI's routing header aligned with the
+// tenant-isolated Responses body key. Client-provided conversation headers are
+// inputs to identity derivation only and must never override the derived value.
+func applyPromptCacheHeader(header http.Header, request Request) {
+	header.Del("X-Grok-Conv-Id")
+	if request.Operation != OperationChat && request.Operation != OperationResponses && request.Operation != OperationMessages {
+		return
+	}
+	if request.CredentialKind != domain.CredentialCLIOAuth && request.CredentialKind != domain.CredentialConsoleSSO {
+		return
+	}
+	if cacheKey := strings.TrimSpace(request.PromptCacheKey); cacheKey != "" {
+		header.Set("X-Grok-Conv-Id", cacheKey)
+	}
 }
 
 func (c *HTTPClient) requestTimeout() time.Duration {

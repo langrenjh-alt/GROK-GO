@@ -38,6 +38,9 @@ type RequestLogHourStats struct {
 	UsageSamples          int64
 	CacheSamples          int64
 	CacheRequestHits      int64
+	CacheWarmupCandidates int64
+	CacheAffinityReuses   int64
+	CacheAffinityMisses   int64
 }
 
 type RequestLogStats struct {
@@ -52,6 +55,9 @@ type RequestLogStats struct {
 	UsageSamples          int64
 	CacheSamples          int64
 	CacheRequestHits      int64
+	CacheWarmupCandidates int64
+	CacheAffinityReuses   int64
+	CacheAffinityMisses   int64
 	Hourly                []RequestLogHourStats
 }
 
@@ -210,7 +216,10 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 			SELECT status_code, duration_ms, input_tokens, output_tokens, usage_parsed,
 				status_code >= 200 AND status_code < 400
 				AND endpoint IN ('/v1/chat/completions', '/v1/responses', '/v1/messages') AS cache_eligible,
-				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens
+				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens,
+				metadata @> '{"cache_identity_applied": true}'::jsonb AS cache_identity_applied,
+				metadata @> '{"cache_affinity_reused": true}'::jsonb AS cache_affinity_reused,
+				metadata @> '{"cache_affinity_established": true}'::jsonb AS cache_affinity_established
 			FROM request_logs
 			WHERE created_at >= $1 AND created_at < $2
 		)
@@ -225,11 +234,15 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 			COALESCE(SUM(normalized_cached_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
 			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed),
 			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0),
-			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0)
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_established AND normalized_cached_tokens = 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_reused),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_reused AND normalized_cached_tokens = 0)
 		FROM cache_rows`, from, to).Scan(
 		&stats.Requests, &stats.Successes, &stats.DurationMS, &stats.InputTokens,
 		&stats.OutputTokens, &stats.CacheEligibleRequests, &stats.CacheInputTokens,
 		&stats.CachedTokens, &stats.UsageSamples, &stats.CacheSamples, &stats.CacheRequestHits,
+		&stats.CacheWarmupCandidates, &stats.CacheAffinityReuses, &stats.CacheAffinityMisses,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate request logs: %w", err)
@@ -239,7 +252,10 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 			SELECT created_at, input_tokens, usage_parsed,
 				status_code >= 200 AND status_code < 400
 				AND endpoint IN ('/v1/chat/completions', '/v1/responses', '/v1/messages') AS cache_eligible,
-				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens
+				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens,
+				metadata @> '{"cache_identity_applied": true}'::jsonb AS cache_identity_applied,
+				metadata @> '{"cache_affinity_reused": true}'::jsonb AS cache_affinity_reused,
+				metadata @> '{"cache_affinity_established": true}'::jsonb AS cache_affinity_established
 			FROM request_logs
 			WHERE created_at >= $1 AND created_at < $2
 		)
@@ -251,7 +267,10 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 			COALESCE(SUM(normalized_cached_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
 			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed),
 			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0),
-			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0)
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_established AND normalized_cached_tokens = 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_reused),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND cache_affinity_reused AND normalized_cached_tokens = 0)
 		FROM cache_rows
 		GROUP BY 1
 		ORDER BY 1`, from, to)
@@ -264,7 +283,8 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 		var hour RequestLogHourStats
 		if err := rows.Scan(&hour.HoursAgo, &hour.Requests, &hour.CacheEligibleRequests,
 			&hour.InputTokens, &hour.CachedTokens, &hour.UsageSamples,
-			&hour.CacheSamples, &hour.CacheRequestHits); err != nil {
+			&hour.CacheSamples, &hour.CacheRequestHits, &hour.CacheWarmupCandidates,
+			&hour.CacheAffinityReuses, &hour.CacheAffinityMisses); err != nil {
 			return nil, fmt.Errorf("scan hourly request log stats: %w", err)
 		}
 		stats.Hourly = append(stats.Hourly, hour)
@@ -289,6 +309,10 @@ func CacheRequestHitRate(hits, samples int64) float64 {
 
 func CacheUsageCoverage(usageSamples, eligibleRequests int64) float64 {
 	return percentage(usageSamples, eligibleRequests)
+}
+
+func CacheAffinityMissRate(misses, reuses int64) float64 {
+	return percentage(misses, reuses)
 }
 
 func percentage(numerator, denominator int64) float64 {

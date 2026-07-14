@@ -7,13 +7,35 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/langrenjh-alt/GROK-GO/internal/apikey"
 )
 
 var claudeSessionSuffix = regexp.MustCompile(`(?i)_session_([a-f0-9-]+)$`)
 
-// promptCacheIdentity creates a tenant-isolated, stable UUID-shaped identity.
-// The same value is used for xAI prompt caching and account affinity.
-func promptCacheIdentity(headers http.Header, model string, payload map[string]any) string {
+type cacheIdentities struct {
+	SessionAffinityKey string
+	PromptCacheKey     string
+}
+
+func requestCacheIdentities(r *http.Request, model string, payload map[string]any) cacheIdentities {
+	tenantID := ""
+	if key, ok := apikey.FromContext(r.Context()); ok {
+		tenantID = key.ID
+	}
+	return resolveCacheIdentities(tenantID, r.Header, model, payload)
+}
+
+// resolveCacheIdentities keeps conversation affinity separate from the
+// reusable static prefix sent to the upstream prompt cache.
+func resolveCacheIdentities(tenantID string, headers http.Header, model string, payload map[string]any) cacheIdentities {
+	return cacheIdentities{
+		SessionAffinityKey: uuidCacheIdentity("grok-session-affinity:v2", tenantID, model, sessionAffinitySeed(headers, model, payload)),
+		PromptCacheKey:     uuidCacheIdentity("grok-prompt-cache:v2", tenantID, model, promptCachePrefix(model, payload)),
+	}
+}
+
+func sessionAffinitySeed(headers http.Header, model string, payload map[string]any) string {
 	seed := requestSession(headers)
 	if seed == "" {
 		seed, _ = payload["prompt_cache_key"].(string)
@@ -28,18 +50,18 @@ func promptCacheIdentity(headers http.Header, model string, payload map[string]a
 	if seed == "" {
 		seed = cachePrefix(model, payload)
 	}
+	return seed
+}
 
-	tenant := strings.TrimSpace(headers.Get("X-Api-Key"))
-	if tenant == "" {
-		tenant = strings.TrimSpace(headers.Get("Authorization"))
-	}
-	if tenant == "" {
-		tenant = "public"
+func uuidCacheIdentity(namespace, tenantID, model, seed string) string {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		tenantID = "public"
 	} else {
-		digest := sha256.Sum256([]byte("grok-go:" + tenant))
-		tenant = hex.EncodeToString(digest[:12])
+		digest := sha256.Sum256([]byte("grok-go:client-key:" + tenantID))
+		tenantID = hex.EncodeToString(digest[:12])
 	}
-	digest := sha256.Sum256([]byte("grok-prompt-cache:v1:" + tenant + ":" + strings.ToLower(strings.TrimSpace(model)) + ":" + seed))
+	digest := sha256.Sum256([]byte(namespace + ":" + tenantID + ":" + strings.ToLower(strings.TrimSpace(model)) + ":" + seed))
 	value := digest[:16]
 	value[6] = (value[6] & 0x0f) | 0x50
 	value[8] = (value[8] & 0x3f) | 0x80
@@ -124,6 +146,123 @@ func cachedTextBlocks(value any) []string {
 		}
 	}
 	return result
+}
+
+func promptCachePrefix(model string, payload map[string]any) string {
+	parts := []string{"model=" + strings.ToLower(strings.TrimSpace(model))}
+	staticPrefix := false
+	for _, key := range []string{"instructions", "system", "developer"} {
+		if encoded, ok := normalizedPromptContent(payload[key]); ok {
+			parts = append(parts, "instruction="+encoded)
+			staticPrefix = true
+		}
+	}
+	for _, key := range []string{"messages", "input"} {
+		for _, raw := range valueSlice(payload[key]) {
+			message, _ := raw.(map[string]any)
+			if message == nil {
+				continue
+			}
+			role := strings.ToLower(strings.TrimSpace(stringField(message, "role")))
+			if role != "system" && role != "developer" {
+				continue
+			}
+			if encoded, ok := normalizedPromptContent(message["content"]); ok {
+				parts = append(parts, "instruction="+encoded)
+				staticPrefix = true
+			}
+		}
+	}
+	if tools, ok := payload["tools"]; ok && meaningfulCacheValue(tools) {
+		parts = append(parts, "tools="+canonicalJSON(tools))
+		staticPrefix = true
+	}
+	if !staticPrefix {
+		appendFirstUserPrefix(&parts, payload)
+	}
+	return strings.Join(parts, "|")
+}
+
+func normalizedPromptContent(value any) (string, bool) {
+	if !meaningfulCacheValue(value) {
+		return "", false
+	}
+	if text, ok := value.(string); ok {
+		return canonicalJSON(text), true
+	}
+	blocks, ok := value.([]any)
+	if !ok {
+		return canonicalJSON(value), true
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			return canonicalJSON(value), true
+		}
+		typeName := strings.ToLower(strings.TrimSpace(stringField(block, "type")))
+		if typeName != "text" && typeName != "input_text" && typeName != "output_text" {
+			return canonicalJSON(value), true
+		}
+		text := stringField(block, "text")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		texts = append(texts, text)
+	}
+	if len(texts) == 0 {
+		return "", false
+	}
+	return canonicalJSON(strings.Join(texts, "\n")), true
+}
+
+func meaningfulCacheValue(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []any:
+		return len(typed) > 0
+	case map[string]any:
+		return len(typed) > 0
+	default:
+		return true
+	}
+}
+
+func appendFirstUserPrefix(parts *[]string, payload map[string]any) {
+	if appendFirstUserFromItems(parts, valueSlice(payload["messages"])) {
+		return
+	}
+	if text, ok := payload["input"].(string); ok {
+		if strings.TrimSpace(text) != "" {
+			*parts = append(*parts, "first_user="+canonicalJSON(text))
+		}
+		return
+	}
+	appendFirstUserFromItems(parts, valueSlice(payload["input"]))
+}
+
+func appendFirstUserFromItems(parts *[]string, items []any) bool {
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(stringField(item, "role")))
+		if role == "user" {
+			if encoded, ok := normalizedPromptContent(item["content"]); ok {
+				*parts = append(*parts, "first_user="+encoded)
+				return true
+			}
+		}
+		if role == "" && strings.EqualFold(stringField(item, "type"), "input_text") && meaningfulCacheValue(item["text"]) {
+			*parts = append(*parts, "first_user="+canonicalJSON(item["text"]))
+			return true
+		}
+	}
+	return false
 }
 
 func cachePrefix(model string, payload map[string]any) string {

@@ -42,13 +42,14 @@ func TestRequestLogCacheStatsIntegration(t *testing.T) {
 	createdAt := windowStart.Add(30 * time.Minute)
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	logs := []domain.RequestLog{
-		{ID: "cache-partial-" + suffix, RequestID: "cache-partial-" + suffix, Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, UsageParsed: true, CreatedAt: createdAt},
+		{ID: "cache-partial-" + suffix, RequestID: "cache-partial-" + suffix, Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, UsageParsed: true, Metadata: []byte(`{"cache_identity_applied":true,"cache_affinity_reused":true}`), CreatedAt: createdAt},
 		{ID: "cache-rate-limited-" + suffix, RequestID: "cache-rate-limited-" + suffix, Endpoint: "/v1/responses", StatusCode: http.StatusTooManyRequests, DurationMS: 300, InputTokens: 300, OutputTokens: 30, CachedTokens: 180, UsageParsed: true, CreatedAt: createdAt},
 		{ID: "missing-usage-" + suffix, RequestID: "missing-usage-" + suffix, Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 500, CreatedAt: createdAt},
 		{ID: "parsed-zero-" + suffix, RequestID: "parsed-zero-" + suffix, Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 80, UsageParsed: true, CreatedAt: createdAt},
 		{ID: "cache-over-report-" + suffix, RequestID: "cache-over-report-" + suffix, Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, CachedTokens: 250, UsageParsed: true, CreatedAt: createdAt},
 		{ID: "non-cache-media-" + suffix, RequestID: "non-cache-media-" + suffix, Endpoint: "/v1/images/generations", StatusCode: http.StatusOK, DurationMS: 200, InputTokens: 400, CachedTokens: 300, UsageParsed: true, CreatedAt: createdAt},
-		{ID: "cache-miss-" + suffix, RequestID: "cache-miss-" + suffix, Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 120, InputTokens: 200, OutputTokens: 10, UsageParsed: true, CreatedAt: createdAt},
+		{ID: "cache-miss-" + suffix, RequestID: "cache-miss-" + suffix, Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 120, InputTokens: 200, OutputTokens: 10, UsageParsed: true, Metadata: []byte(`{"cache_identity_applied":true,"cache_affinity_reused":true}`), CreatedAt: createdAt},
+		{ID: "cache-warmup-" + suffix, RequestID: "cache-warmup-" + suffix, Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 50, InputTokens: 50, OutputTokens: 5, UsageParsed: true, Metadata: []byte(`{"cache_identity_applied":true,"cache_affinity_reused":false,"cache_affinity_established":true}`), CreatedAt: createdAt},
 	}
 	for index := range logs {
 		if err := repository.CreateRequestLog(ctx, &logs[index]); err != nil {
@@ -67,13 +68,13 @@ func TestRequestLogCacheStatsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Requests != 7 || stats.Successes != 6 || stats.DurationMS != 1400 || stats.InputTokens != 1100 || stats.OutputTokens != 60 {
+	if stats.Requests != 8 || stats.Successes != 7 || stats.DurationMS != 1450 || stats.InputTokens != 1150 || stats.OutputTokens != 65 {
 		t.Fatalf("request stats = %+v", stats)
 	}
-	if stats.CacheEligibleRequests != 5 || stats.UsageSamples != 4 || stats.CacheSamples != 3 || stats.CacheRequestHits != 2 || stats.CacheInputTokens != 400 || stats.CachedTokens != 140 {
+	if stats.CacheEligibleRequests != 6 || stats.UsageSamples != 5 || stats.CacheSamples != 4 || stats.CacheRequestHits != 2 || stats.CacheWarmupCandidates != 1 || stats.CacheAffinityReuses != 2 || stats.CacheAffinityMisses != 1 || stats.CacheInputTokens != 450 || stats.CachedTokens != 140 {
 		t.Fatalf("cache stats = %+v", stats)
 	}
-	if len(stats.Hourly) != 1 || stats.Hourly[0].HoursAgo != 0 || stats.Hourly[0].CacheEligibleRequests != 5 || stats.Hourly[0].UsageSamples != 4 || stats.Hourly[0].CacheSamples != 3 || stats.Hourly[0].CacheRequestHits != 2 {
+	if len(stats.Hourly) != 1 || stats.Hourly[0].HoursAgo != 0 || stats.Hourly[0].CacheEligibleRequests != 6 || stats.Hourly[0].UsageSamples != 5 || stats.Hourly[0].CacheSamples != 4 || stats.Hourly[0].CacheRequestHits != 2 || stats.Hourly[0].CacheWarmupCandidates != 1 || stats.Hourly[0].CacheAffinityReuses != 2 || stats.Hourly[0].CacheAffinityMisses != 1 {
 		t.Fatalf("hourly cache stats = %+v", stats.Hourly)
 	}
 }

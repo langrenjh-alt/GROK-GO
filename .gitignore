@@ -19,6 +19,7 @@
 **/.env.*
 !**/.env.example
 /data/
+/data-local/
 /logs/
 *.log
 *.pem

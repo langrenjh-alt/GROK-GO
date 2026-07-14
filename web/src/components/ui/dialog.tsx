@@ -9,7 +9,7 @@ export const Dialog = DialogPrimitive.Root;
 export const DialogTrigger = DialogPrimitive.Trigger;
 export const DialogClose = DialogPrimitive.Close;
 
-export function DialogContent({ children, title, description, className }: { children: React.ReactNode; title: string; description?: string; className?: string }) {
+export function DialogContent({ children, title, description, className, closeDisabled = false }: { children: React.ReactNode; title: string; description?: string; className?: string; closeDisabled?: boolean }) {
   return (
     <DialogPrimitive.Portal>
       <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[1px] data-[state=closed]:animate-fade-out data-[state=open]:animate-fade-in motion-reduce:animate-none" />
@@ -20,7 +20,7 @@ export function DialogContent({ children, title, description, className }: { chi
             {description ? <DialogPrimitive.Description className="text-copy-13 text-fg-muted">{description}</DialogPrimitive.Description> : null}
           </div>
           <DialogPrimitive.Close asChild>
-            <IconButton label="Close" variant="tertiary" className="-mr-1 -mt-1"><X className="size-4" /></IconButton>
+            <IconButton label="Close" variant="tertiary" className="-mr-1 -mt-1" disabled={closeDisabled}><X className="size-4" /></IconButton>
           </DialogPrimitive.Close>
         </div>
         {children}

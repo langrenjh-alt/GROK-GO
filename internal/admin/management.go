@@ -432,6 +432,18 @@ func (s *ManagementService) DeleteAccount(ctx context.Context, id string) error 
 	return s.accounts.DeleteAccount(ctx, id)
 }
 
+// DeleteAccounts removes a validated account selection atomically.
+func (s *ManagementService) DeleteAccounts(ctx context.Context, ids []string) (int, error) {
+	ids = cleanStrings(ids)
+	if len(ids) == 0 || len(ids) > 500 {
+		return 0, errors.New("select between 1 and 500 accounts")
+	}
+	if err := s.accounts.DeleteAccounts(ctx, ids); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
 func (s *ManagementService) CreateModel(ctx context.Context, model *domain.ModelSpec) error {
 	if err := validateModel(model); err != nil {
 		return err

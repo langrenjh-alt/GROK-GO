@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +50,35 @@ func TestUpdateAccountsRollsBackWhenCommitFails(t *testing.T) {
 	err := repository.UpdateAccounts(context.Background(), []*domain.Account{batchAccount("first"), batchAccount("second")})
 	if err == nil || !tx.rolledBack || len(tx.persisted) != 0 {
 		t.Fatalf("commit failure did not roll back: err=%v tx=%+v", err, tx)
+	}
+}
+
+func TestDeleteAccountsCommitsMatchingRowsInOneTransaction(t *testing.T) {
+	tx := &fakeAccountDeleteTransaction{rowsAffected: 2}
+	repository := &Postgres{beginTx: func(context.Context) (transaction, error) { return tx, nil }}
+	ids := []string{"first", "second"}
+
+	if err := repository.DeleteAccounts(context.Background(), ids); err != nil {
+		t.Fatal(err)
+	}
+	if !tx.committed || tx.rolledBack {
+		t.Fatalf("delete transaction did not commit cleanly: %+v", tx)
+	}
+	if strings.Join(tx.persisted, ",") != "first,second" {
+		t.Fatalf("persisted deletions = %v, want %v", tx.persisted, ids)
+	}
+}
+
+func TestDeleteAccountsRollsBackWhenAnyIDIsMissing(t *testing.T) {
+	tx := &fakeAccountDeleteTransaction{rowsAffected: 1}
+	repository := &Postgres{beginTx: func(context.Context) (transaction, error) { return tx, nil }}
+
+	err := repository.DeleteAccounts(context.Background(), []string{"present", "missing"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteAccounts() error = %v, want ErrNotFound", err)
+	}
+	if tx.committed || !tx.rolledBack || len(tx.staged) != 0 || len(tx.persisted) != 0 {
+		t.Fatalf("partial delete was not rolled back: %+v", tx)
 	}
 }
 
@@ -123,5 +154,52 @@ func (r fakeAccountUpdateRow) Scan(destinations ...any) error {
 		return errors.New("unexpected scan destination")
 	}
 	*updatedAt = r.updatedAt
+	return nil
+}
+
+type fakeAccountDeleteTransaction struct {
+	rowsAffected int64
+	staged       []string
+	persisted    []string
+	committed    bool
+	rolledBack   bool
+}
+
+func (t *fakeAccountDeleteTransaction) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if !strings.Contains(query, "DELETE FROM accounts WHERE id = ANY($1::text[])") {
+		return pgconn.CommandTag{}, errors.New("unexpected delete query")
+	}
+	if len(args) != 1 {
+		return pgconn.CommandTag{}, errors.New("unexpected delete argument count")
+	}
+	ids, ok := args[0].([]string)
+	if !ok {
+		return pgconn.CommandTag{}, errors.New("unexpected delete argument")
+	}
+	t.staged = append(t.staged, ids...)
+	return pgconn.NewCommandTag("DELETE " + strconv.FormatInt(t.rowsAffected, 10)), nil
+}
+
+func (t *fakeAccountDeleteTransaction) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query")
+}
+
+func (t *fakeAccountDeleteTransaction) QueryRow(context.Context, string, ...any) pgx.Row {
+	return fakeAccountUpdateRow{err: errors.New("unexpected QueryRow")}
+}
+
+func (t *fakeAccountDeleteTransaction) Commit(context.Context) error {
+	t.persisted = append(t.persisted, t.staged...)
+	t.staged = nil
+	t.committed = true
+	return nil
+}
+
+func (t *fakeAccountDeleteTransaction) Rollback(context.Context) error {
+	if t.committed {
+		return pgx.ErrTxClosed
+	}
+	t.staged = nil
+	t.rolledBack = true
 	return nil
 }

@@ -126,6 +126,7 @@ func TestPreparePayloadAddsCacheRoutingOnlyWithoutToolIntent(t *testing.T) {
 func TestPrepareConsolePayloadAppliesModelDefaults(t *testing.T) {
 	encoded, err := preparePayload(Request{
 		Operation: OperationChat, Model: "grok-4.3-high", UpstreamModel: "grok-4.3",
+		PromptCacheKey: "33333333-3333-5333-8333-333333333333",
 		CredentialKind: domain.CredentialConsoleSSO, Body: json.RawMessage(`{"messages":[{"role":"user","content":"hello"}]}`), Stream: true,
 	})
 	if err != nil {
@@ -134,7 +135,61 @@ func TestPrepareConsolePayloadAppliesModelDefaults(t *testing.T) {
 	var payload map[string]any
 	_ = json.Unmarshal(encoded, &payload)
 	reasoning := payload["reasoning"].(map[string]any)
-	if reasoning["effort"] != "high" || payload["max_output_tokens"].(float64) != 1_000_000 || payload["tool_choice"] != "auto" {
+	if reasoning["effort"] != "high" || payload["max_output_tokens"].(float64) != 1_000_000 || payload["tool_choice"] != "auto" || payload["prompt_cache_key"] != "33333333-3333-5333-8333-333333333333" {
 		t.Fatalf("console defaults missing: %s", encoded)
+	}
+}
+
+func TestPrepareResponsesPayloadUsesDerivedCacheIdentityByCredentialKind(t *testing.T) {
+	const isolatedKey = "44444444-4444-5444-8444-444444444444"
+	for _, test := range []struct {
+		name      string
+		kind      domain.CredentialKind
+		wantCache bool
+	}{
+		{name: "CLI OAuth", kind: domain.CredentialCLIOAuth, wantCache: true},
+		{name: "Console SSO", kind: domain.CredentialConsoleSSO, wantCache: true},
+		{name: "Grok SSO", kind: domain.CredentialGrokSSO, wantCache: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := preparePayload(Request{
+				Operation: OperationResponses, Model: "grok", UpstreamModel: "grok-4.5",
+				PromptCacheKey: isolatedKey, CredentialKind: test.kind,
+				Body: json.RawMessage(`{"input":"hello","prompt_cache_key":"raw-client-key"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatal(err)
+			}
+			value, present := payload["prompt_cache_key"]
+			if test.wantCache {
+				if !present || value != isolatedKey {
+					t.Fatalf("prompt_cache_key = %#v, payload=%s", value, encoded)
+				}
+			} else if present {
+				t.Fatalf("private Grok web payload leaked prompt_cache_key: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestPrepareConsoleResponsesPayloadDropsRawCacheKeyWithoutDerivedIdentity(t *testing.T) {
+	encoded, err := preparePayload(Request{
+		Operation: OperationResponses, Model: "grok", UpstreamModel: "grok-4.3",
+		CredentialKind: domain.CredentialConsoleSSO,
+		Body:           json.RawMessage(`{"input":"hello","prompt_cache_key":"raw-client-key"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payload["prompt_cache_key"]; present {
+		t.Fatalf("raw client cache key was forwarded: %s", encoded)
 	}
 }

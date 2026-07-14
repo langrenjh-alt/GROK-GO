@@ -22,6 +22,29 @@ const account = {
 const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
 const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function dataResponse(data: unknown) {
+  return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+function quotaSummary(total: number) {
+  return {
+    total_accounts: total,
+    available_accounts: total,
+    requests: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: total, unlimited_accounts: 0, window_count: 0 },
+    tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: total, unlimited_accounts: 0, window_count: 0 },
+  };
+}
+
 describe("AccountsView", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -42,7 +65,7 @@ describe("AccountsView", () => {
         requests: { state: "known", limit: 100, used: 40, remaining: 60, usage_percent: 40, known_accounts: 1, unknown_accounts: 0, unlimited_accounts: 0, window_count: 1 },
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
-      if (path.endsWith("/proxies")) data = { items: [{ id: "proxy-1", name: "Primary proxy", enabled: true, healthy: true, created_at: account.created_at, updated_at: account.updated_at }], total: 1 };
+      if (path.includes("/proxies")) data = { items: [{ id: "proxy-1", name: "Primary proxy", enabled: true, healthy: true, created_at: account.created_at, updated_at: account.updated_at }], total: 1 };
       if (path.endsWith("/accounts/policy")) data = { strategy: init?.method === "PUT" ? "round_robin" : "affinity" };
       if (path.endsWith("/accounts/batch")) data = { updated: 1, items: [{ ...account, status: "disabled" }] };
       return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -91,7 +114,7 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
       if (path.endsWith("/accounts/account-1") && init?.method === "PATCH") {
         current = { ...current, ...JSON.parse(String(init.body)) };
         data = current;
@@ -137,7 +160,7 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
       if (path.endsWith("/accounts/account-1/probe") && init?.method === "POST") data = {
         account_id: account.id,
         success: false,
@@ -195,8 +218,8 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
-      if (path.endsWith("/accounts/import") && init?.method === "POST") data = { imported: 2, failed: 0, items: [] };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
+      if (path.endsWith("/accounts/import") && init?.method === "POST") data = { imported: 2, failed: 0, items: [], post_action: { action: "refresh_probe", total: 2, succeeded: 2, failed: 0 } };
       if (path.endsWith("/oauth/refresh/account-oauth") && init?.method === "POST") data = oauthAccount;
       return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
     });
@@ -219,16 +242,66 @@ describe("AccountsView", () => {
     expect(screen.getByText("已选择 2 个文件")).toBeVisible();
     expect(screen.getByText("first.json")).toBeVisible();
     expect(screen.getByText("second.json")).toBeVisible();
+    expect(screen.getByLabelText("导入后状态")).toHaveValue("active");
+    expect(screen.getByLabelText("导入后操作")).toHaveValue("refresh_probe");
 
     await user.click(screen.getByRole("button", { name: "开始导入" }));
     await waitFor(() => {
       const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith("/accounts/import") && init?.method === "POST");
       const body = request?.[1]?.body as FormData | undefined;
       expect(body?.getAll("files").map((file) => (file as File).name)).toEqual(["first.json", "second.json"]);
+      expect(body?.get("initial_status")).toBe("active");
+      expect(body?.get("post_import_action")).toBe("refresh_probe");
     });
+    expect(await screen.findByText("已导入 2 个账号；凭据刷新与探测 2/2 成功")).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "刷新 OAuth 凭据" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/admin/api/oauth/refresh/account-oauth", expect.objectContaining({ method: "POST" })));
+  });
+
+  it("keeps partial import failures visible with a complete summary", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      let data: unknown = {};
+      if (path.includes("/accounts?")) data = { items: [], total: 0 };
+      if (path.endsWith("/accounts/quota-summary")) data = {
+        total_accounts: 0,
+        available_accounts: 0,
+        requests: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 0, unlimited_accounts: 0, window_count: 0 },
+        tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 0, unlimited_accounts: 0, window_count: 0 },
+      };
+      if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
+      if (path.endsWith("/accounts/import") && init?.method === "POST") data = {
+        imported: 1,
+        skipped: 1,
+        failed: 1,
+        errors: ["invalid OAuth file"],
+        post_action: {
+          action: "refresh_probe",
+          total: 1,
+          succeeded: 0,
+          failed: 1,
+          items: [{ account_id: "account-imported", success: false, message: "account probe returned HTTP 403" }],
+        },
+      };
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    render(<I18nProvider><ToastProvider><AccountsView /></ToastProvider></I18nProvider>);
+    await screen.findByRole("heading", { name: "账号池" });
+    await user.click(screen.getByRole("button", { name: "批量导入" }));
+    await user.click(screen.getByRole("button", { name: "开始导入" }));
+
+    const importAlert = await screen.findByRole("alert");
+    expect(importAlert).toHaveTextContent("invalid OAuth file");
+    expect(importAlert).toHaveTextContent("account probe returned HTTP 403");
+    expect(importAlert).toHaveTextContent("跳过 1");
+    expect(importAlert).toHaveTextContent("导入失败 1");
+    expect(screen.getByRole("dialog", { name: "批量导入账号" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "开始导入" })).toBeEnabled();
   });
 
   it("prompts for an explicit account selection before export", async () => {
@@ -244,7 +317,7 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
       if (path.endsWith("/auth/me")) data = { id: "admin-1", email: "admin@example.com", totp_enabled: false };
       return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
     });
@@ -272,7 +345,7 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 2, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
       if (path.endsWith("/auth/me")) data = { id: "admin-1", email: "admin@example.com", totp_enabled: true };
       if (path.endsWith("/accounts/export") && init?.method === "POST") {
         return new Response('{"accounts":[{"id":"account-1"}]}', {
@@ -335,7 +408,7 @@ describe("AccountsView", () => {
         tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 },
       };
       if (path.endsWith("/accounts/policy")) data = { strategy: "affinity" };
-      if (path.endsWith("/proxies")) data = { items: [], total: 0 };
+      if (path.includes("/proxies")) data = { items: [], total: 0 };
       if (path.endsWith("/auth/me")) data = { id: "admin-1", email: "admin@example.com", totp_enabled: false };
       if (path.endsWith("/accounts/export") && init?.method === "POST") {
         return new Response(JSON.stringify({ error: { code: "incompatible_accounts", message: "sub2api export only supports CLI OAuth accounts" } }), { status: 400, headers: { "Content-Type": "application/json" } });
@@ -355,5 +428,157 @@ describe("AccountsView", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("sub2api export only supports CLI OAuth accounts");
     expect(screen.getByRole("dialog", { name: "导出账号" })).toBeVisible();
+  });
+
+  it("shows progress and reloads both accounts and quota on manual refresh", async () => {
+    const refreshedAccount = { ...account, name: "Refreshed Primary" };
+    const refreshedAccounts = deferred<Response>();
+    const refreshedQuota = deferred<Response>();
+    let accountReads = 0;
+    let quotaReads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("/accounts?")) {
+        accountReads += 1;
+        return accountReads === 1 ? dataResponse({ items: [account], total: 1 }) : refreshedAccounts.promise;
+      }
+      if (path.endsWith("/accounts/quota-summary")) {
+        quotaReads += 1;
+        return quotaReads === 1 ? dataResponse(quotaSummary(1)) : refreshedQuota.promise;
+      }
+      if (path.endsWith("/accounts/policy")) return dataResponse({ strategy: "affinity" });
+      if (path.includes("/proxies")) return dataResponse({ items: [], total: 0 });
+      if (path.endsWith("/auth/me")) return dataResponse({ id: "admin-1", email: "admin@example.com", totp_enabled: false });
+      return dataResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    render(<I18nProvider><ToastProvider><AccountsView /></ToastProvider></I18nProvider>);
+    expect(await screen.findByText("Primary")).toBeInTheDocument();
+
+    const refreshButton = screen.getByRole("button", { name: "刷新" });
+    await user.click(refreshButton);
+    await waitFor(() => {
+      expect(accountReads).toBe(2);
+      expect(quotaReads).toBe(2);
+      expect(refreshButton).toHaveAttribute("aria-busy", "true");
+    });
+
+    refreshedAccounts.resolve(dataResponse({ items: [refreshedAccount], total: 1 }));
+    refreshedQuota.resolve(dataResponse(quotaSummary(1)));
+
+    expect(await screen.findByText("Refreshed Primary")).toBeVisible();
+    expect(await screen.findByText("账号池已刷新")).toBeVisible();
+    await waitFor(() => expect(refreshButton).not.toHaveAttribute("aria-busy"));
+  });
+
+  it("cancels and then confirms deletion of one account", async () => {
+    let accounts = [account];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("/accounts?")) return dataResponse({ items: accounts, total: accounts.length });
+      if (path.endsWith("/accounts/quota-summary")) return dataResponse(quotaSummary(accounts.length));
+      if (path.endsWith("/accounts/policy")) return dataResponse({ strategy: "affinity" });
+      if (path.includes("/proxies")) return dataResponse({ items: [], total: 0 });
+      if (path.endsWith("/auth/me")) return dataResponse({ id: "admin-1", email: "admin@example.com", totp_enabled: false });
+      if (path.endsWith("/accounts/account-1") && init?.method === "DELETE") {
+        accounts = [];
+        return dataResponse({ deleted: 1 });
+      }
+      return dataResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    render(<I18nProvider><ToastProvider><AccountsView /></ToastProvider></I18nProvider>);
+    expect(await screen.findByText("Primary")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除账号" }));
+    expect(await screen.findByRole("dialog", { name: "删除账号" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "删除账号" })).not.toBeInTheDocument());
+    expect(fetchMock.mock.calls.some(([path, init]) => String(path).endsWith("/accounts/account-1") && init?.method === "DELETE")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "删除账号" }));
+    await user.click(screen.getByRole("button", { name: "删除" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/admin/api/accounts/account-1", expect.objectContaining({ method: "DELETE" })));
+    expect(await screen.findByText("已删除 1 个账号")).toBeVisible();
+    expect(screen.queryByText("Primary")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "删除账号" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the delete dialog open when deleting one account fails", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("/accounts?")) return dataResponse({ items: [account], total: 1 });
+      if (path.endsWith("/accounts/quota-summary")) return dataResponse(quotaSummary(1));
+      if (path.endsWith("/accounts/policy")) return dataResponse({ strategy: "affinity" });
+      if (path.includes("/proxies")) return dataResponse({ items: [], total: 0 });
+      if (path.endsWith("/auth/me")) return dataResponse({ id: "admin-1", email: "admin@example.com", totp_enabled: false });
+      if (path.endsWith("/accounts/account-1") && init?.method === "DELETE") {
+        return new Response(JSON.stringify({ error: { code: "account_in_use", message: "Account is still in use" } }), { status: 409, headers: { "Content-Type": "application/json" } });
+      }
+      return dataResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    render(<I18nProvider><ToastProvider><AccountsView /></ToastProvider></I18nProvider>);
+    expect(await screen.findByText("Primary")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除账号" }));
+    await user.click(screen.getByRole("button", { name: "删除" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Account is still in use");
+    expect(screen.getByRole("dialog", { name: "删除账号" })).toBeVisible();
+    expect(screen.getAllByText("Primary")).toHaveLength(2);
+  });
+
+  it("batch deletes exactly the selected accounts and clears the selection", async () => {
+    const secondAccount = { ...account, id: "account-2", name: "Secondary" };
+    const thirdAccount = { ...account, id: "account-3", name: "Tertiary" };
+    let accounts = [account, secondAccount, thirdAccount];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes("/accounts?")) return dataResponse({ items: accounts, total: accounts.length });
+      if (path.endsWith("/accounts/quota-summary")) return dataResponse(quotaSummary(accounts.length));
+      if (path.endsWith("/accounts/policy")) return dataResponse({ strategy: "affinity" });
+      if (path.includes("/proxies")) return dataResponse({ items: [], total: 0 });
+      if (path.endsWith("/auth/me")) return dataResponse({ id: "admin-1", email: "admin@example.com", totp_enabled: false });
+      if (path.endsWith("/accounts/batch-delete") && init?.method === "POST") {
+        const { ids } = JSON.parse(String(init.body)) as { ids: string[] };
+        accounts = accounts.filter((item) => !ids.includes(item.id));
+        return dataResponse({ deleted: ids.length });
+      }
+      return dataResponse({});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    render(<I18nProvider><ToastProvider><AccountsView /></ToastProvider></I18nProvider>);
+    expect(await screen.findByText("Primary")).toBeInTheDocument();
+    expect(screen.getByText("Secondary")).toBeInTheDocument();
+    expect(screen.getByText("Tertiary")).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("选择 Primary"));
+    const selectVisible = screen.getByLabelText("选择当前账号") as HTMLInputElement;
+    expect(selectVisible.indeterminate).toBe(true);
+    expect(selectVisible).toHaveAttribute("aria-checked", "mixed");
+    await user.click(screen.getByLabelText("选择 Tertiary"));
+    await user.click(screen.getByRole("button", { name: "删除所选 (2)" }));
+    expect(await screen.findByRole("dialog", { name: "删除 2 个账号" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "删除" }));
+
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith("/accounts/batch-delete") && init?.method === "POST");
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ ids: ["account-1", "account-3"] });
+    });
+    expect(await screen.findByText("已删除 2 个账号")).toBeVisible();
+    expect(screen.getByText("Secondary")).toBeVisible();
+    expect(screen.queryByText("Primary")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tertiary")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除所选 (0)" })).toBeDisabled();
   });
 });

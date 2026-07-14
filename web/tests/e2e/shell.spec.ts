@@ -10,11 +10,15 @@ test("desktop console shell exposes primary navigation", async ({ page, isMobile
   await expect(page.getByRole("heading", { name: /运行概览|Runtime Overview/ })).toBeVisible();
 });
 
-test("account import, OAuth, and debugger controls are available", async ({ page, isMobile }) => {
+test("account filters, import, OAuth, and debugger controls are available", async ({ page, isMobile }) => {
   test.skip(Boolean(isMobile), "desktop project only");
   await page.route("**/admin/api/auth/me", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { id: "admin-1", email: "admin@example.com" } }) }));
   await page.route("**/admin/api/accounts", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { items: [], total: 0 } }) }));
   await page.goto("/accounts/");
+  await expect(page.getByLabel(/按凭据类型筛选|Filter by credential type/)).toBeVisible();
+  await expect(page.getByLabel(/按账号等级筛选|Filter by account tier/)).toBeVisible();
+  await expect(page.getByLabel(/按绑定代理筛选|Filter by bound proxy/)).toBeVisible();
+  await expect(page.getByLabel(/账号调度策略|Account scheduling strategy/)).toBeVisible();
   await page.getByRole("button", { name: /批量导入|Import/ }).click();
   await expect(page.getByRole("dialog", { name: /批量导入账号|Import Accounts/ })).toBeVisible();
   await page.keyboard.press("Escape");

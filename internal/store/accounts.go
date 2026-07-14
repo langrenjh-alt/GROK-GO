@@ -16,10 +16,12 @@ const accountColumns = `
 
 type AccountFilter struct {
 	Pagination
-	Kind   domain.CredentialKind
-	Status domain.AccountStatus
-	Model  string
-	Query  string
+	Kind    domain.CredentialKind
+	Status  domain.AccountStatus
+	Tier    string
+	ProxyID *string
+	Model   string
+	Query   string
 }
 
 func (p *Postgres) CreateAccount(ctx context.Context, account *domain.Account) error {
@@ -114,7 +116,7 @@ func (p *Postgres) CountAccounts(ctx context.Context, filter AccountFilter) (int
 
 func accountFilterSQL(filter AccountFilter) (string, []any) {
 	query := "WHERE TRUE"
-	args := make([]any, 0, 4)
+	args := make([]any, 0, 6)
 	add := func(condition string, value any) {
 		args = append(args, value)
 		query += " AND " + fmt.Sprintf(condition, len(args))
@@ -124,6 +126,16 @@ func accountFilterSQL(filter AccountFilter) (string, []any) {
 	}
 	if filter.Status != "" {
 		add("status = $%d", filter.Status)
+	}
+	if tier := strings.TrimSpace(filter.Tier); tier != "" {
+		add("LOWER(tier) = LOWER($%d)", tier)
+	}
+	if filter.ProxyID != nil {
+		if proxyID := strings.TrimSpace(*filter.ProxyID); proxyID != "" {
+			add("proxy_id = $%d", proxyID)
+		} else {
+			query += " AND proxy_id IS NULL"
+		}
 	}
 	if model := strings.TrimSpace(filter.Model); model != "" {
 		encoded, _ := json.Marshal([]string{model})
@@ -265,6 +277,31 @@ func (p *Postgres) DeleteAccount(ctx context.Context, id string) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteAccounts(ctx context.Context, ids []string) error {
+	if len(ids) == 0 || len(ids) > 500 {
+		return errorsNew("select between 1 and 500 accounts")
+	}
+	if p.beginTx == nil {
+		return errorsNew("account transactions are not configured")
+	}
+	tx, err := p.beginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin account delete transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	tag, err := tx.Exec(ctx, `DELETE FROM accounts WHERE id = ANY($1::text[])`, ids)
+	if err != nil {
+		return translateError(err)
+	}
+	if tag.RowsAffected() != int64(len(ids)) {
+		return ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return translateError(err)
 	}
 	return nil
 }

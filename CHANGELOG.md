@@ -2,6 +2,48 @@
 
 All notable changes to GROK-GO are documented in this file.
 
+## [0.1.2] - 2026-07-14
+
+### Added
+
+- Added server-side account search and filters for status, credential kind,
+  tier, and bound or direct proxy, with matching controls in the account-pool
+  console.
+- Added single-account and atomic batch deletion, including post-commit pool
+  eviction and administrator confirmation flows.
+- Added import controls for `initial_status`/`status` and
+  `post_import_action=none|refresh|refresh_probe`. The console now defaults new
+  CLI OAuth imports to bounded credential refresh and health probing before
+  they enter scheduling.
+- Added dashboard counters for cache warmup candidates, affinity reuses,
+  affinity reuse misses, and the affinity reuse miss rate.
+
+### Changed
+
+- Split the tenant-isolated session-affinity identity from the upstream
+  prompt-cache identity. Static prompt components now drive the upstream cache
+  key, while explicit session signals and the conversation prefix drive account
+  affinity.
+- Send the generated `prompt_cache_key` and matching `X-Grok-Conv-Id` on both
+  CLI OAuth and Console SSO routes. The private Grok SSO Web schema remains
+  unchanged.
+- Clear precise local and Redis affinity bindings when their account becomes
+  unavailable through cooldown, disablement, quota exhaustion, or terminal
+  feedback. Capacity-only fallbacks preserve the existing affinity instead of
+  replacing it.
+- Hardened account-list reloads and post-import actions with cancellation-aware
+  coordination, bounded concurrency, detached completion, and sanitized error
+  summaries.
+
+### Fixed
+
+- Fixed account-pool refresh, OAuth refresh, enable/disable, multi-file import,
+  batch editing, and selection-aware bulk actions in the administration
+  console.
+- Fixed Cloudflare challenge responses being exposed as raw HTML or treated as
+  permanent account disablement; affected accounts now enter a bounded
+  cooldown with a concise diagnostic.
+
 ## [0.1.1] - 2026-07-14
 
 ### Added
@@ -89,5 +131,6 @@ All notable changes to GROK-GO are documented in this file.
 
 - Initial GROK-GO release.
 
+[0.1.2]: https://github.com/langrenjh-alt/GROK-GO/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/langrenjh-alt/GROK-GO/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/langrenjh-alt/GROK-GO/releases/tag/v0.1.0

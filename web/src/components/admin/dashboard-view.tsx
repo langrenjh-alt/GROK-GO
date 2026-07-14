@@ -22,11 +22,15 @@ interface DashboardData {
   usage_samples_24h: number;
   cache_samples_24h: number;
   cache_request_hits_24h: number;
+  cache_warmup_candidates_24h: number;
+  cache_affinity_reuses_24h: number;
+  cache_affinity_misses_24h: number;
   cache_eligible_requests_24h: number;
   cache_hit_rate: number;
   cache_token_reuse_rate: number;
   cache_request_hit_rate: number;
   cache_usage_coverage: number;
+  cache_affinity_miss_rate: number;
   active_accounts: number;
   total_accounts: number;
   active_keys: number;
@@ -36,6 +40,9 @@ interface DashboardData {
   hourly_cached_tokens: number[];
   hourly_usage_samples: number[];
   hourly_cache_samples: number[];
+  hourly_cache_warmup_candidates: number[];
+  hourly_cache_affinity_reuses: number[];
+  hourly_cache_affinity_misses: number[];
   hourly_cache_hit_rate: number[];
   hourly_cache_token_reuse_rate: number[];
   recent_logs: RequestLog[];
@@ -53,11 +60,15 @@ const initialDashboard: DashboardData = {
   usage_samples_24h: 0,
   cache_samples_24h: 0,
   cache_request_hits_24h: 0,
+  cache_warmup_candidates_24h: 0,
+  cache_affinity_reuses_24h: 0,
+  cache_affinity_misses_24h: 0,
   cache_eligible_requests_24h: 0,
   cache_hit_rate: 0,
   cache_token_reuse_rate: 0,
   cache_request_hit_rate: 0,
   cache_usage_coverage: 0,
+  cache_affinity_miss_rate: 0,
   active_accounts: 0,
   total_accounts: 0,
   active_keys: 0,
@@ -67,6 +78,9 @@ const initialDashboard: DashboardData = {
   hourly_cached_tokens: emptyHours(),
   hourly_usage_samples: emptyHours(),
   hourly_cache_samples: emptyHours(),
+  hourly_cache_warmup_candidates: emptyHours(),
+  hourly_cache_affinity_reuses: emptyHours(),
+  hourly_cache_affinity_misses: emptyHours(),
   hourly_cache_hit_rate: emptyHours(),
   hourly_cache_token_reuse_rate: emptyHours(),
   recent_logs: [],
@@ -132,6 +146,14 @@ export function DashboardView() {
   const cacheRequestHitRate = data.cache_request_hit_rate ?? 0;
   const cacheEligibleRequests = data.cache_eligible_requests_24h ?? 0;
   const cacheUsageCoverage = data.cache_usage_coverage ?? 0;
+  const cacheWarmupCandidates = data.cache_warmup_candidates_24h ?? 0;
+  const cacheAffinityReuses = data.cache_affinity_reuses_24h ?? 0;
+  const cacheAffinityMisses = data.cache_affinity_misses_24h ?? 0;
+  const cacheAffinityMissRate = data.cache_affinity_miss_rate ?? 0;
+  const cacheAffinityMissValue = cacheAffinityReuses > 0 ? `${cacheAffinityMissRate.toFixed(1)}%` : "-";
+  const cacheAffinityMissDetail = cacheAffinityReuses > 0
+    ? `${formatNumber(cacheAffinityMisses)} / ${formatNumber(cacheAffinityReuses)} ${locale === "zh" ? "次亲和复用" : "affinity reuses"}`
+    : locale === "zh" ? "暂无亲和复用样本" : "No affinity reuse samples";
   const cacheDetail = cacheSamples > 0
     ? `${formatNumber(data.cached_tokens_24h)} / ${formatNumber(data.input_tokens_24h)} ${locale === "zh" ? "输入 Token" : "input tokens"}`
     : locale === "zh" ? "暂无有效 usage" : "No valid usage";
@@ -154,9 +176,11 @@ export function DashboardView() {
           </div>
           <div className="mt-2 flex justify-between text-[11px] text-fg-subtle"><span>{locale === "zh" ? "24 小时前" : "24h ago"}</span><span>{locale === "zh" ? "12 小时前" : "12h ago"}</span><span>{locale === "zh" ? "当前" : "Now"}</span></div>
           <CacheTrend rates={hourlyCacheTokenReuseRate} inputTokens={hourlyInputTokens} cachedTokens={hourlyCachedTokens} samples={hourlyCacheSamples} locale={locale} />
-          <div className="mt-4 grid grid-cols-2 divide-x divide-border border-y border-border">
-            <div className="min-w-0 py-3 pr-4"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "缓存请求命中率" : "Request Hit Rate"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheRequestHitRate.toFixed(1)}%</strong><p className="truncate text-copy-13 text-fg-subtle">{formatNumber(cacheRequestHits)} / {formatNumber(cacheSamples)} {locale === "zh" ? "次请求" : "requests"}</p></div>
-            <div className="min-w-0 py-3 pl-4"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "Usage 覆盖率" : "Usage Coverage"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheUsageCoverage.toFixed(1)}%</strong><p className="truncate text-copy-13 text-fg-subtle">{formatNumber(data.usage_samples_24h)} / {formatNumber(cacheEligibleRequests)} {locale === "zh" ? "次请求" : "requests"}</p></div>
+          <div className="mt-4 grid grid-cols-2 border-y border-border 2xl:grid-cols-4">
+            <div className="min-w-0 border-b border-r border-border py-3 pr-3 2xl:border-b-0"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "缓存请求命中率" : "Request Hit Rate"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheRequestHitRate.toFixed(1)}%</strong><p className="text-copy-13 leading-5 text-fg-subtle">{formatNumber(cacheRequestHits)} / {formatNumber(cacheSamples)} {locale === "zh" ? "次请求" : "requests"}</p></div>
+            <div className="min-w-0 border-b border-border py-3 pl-3 2xl:border-b-0 2xl:border-r 2xl:pr-3"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "缓存预热候选" : "Warmup Candidates"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{formatNumber(cacheWarmupCandidates)}</strong><p className="text-copy-13 leading-5 text-fg-subtle">{locale === "zh" ? "新建亲和绑定，缓存尚未命中" : "New affinity binding, cache not hit yet"}</p></div>
+            <div className="min-w-0 border-r border-border py-3 pr-3"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "亲和复用未命中率" : "Affinity Reuse Miss Rate"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheAffinityMissValue}</strong><p className="text-copy-13 leading-5 text-fg-subtle">{cacheAffinityMissDetail}</p></div>
+            <div className="min-w-0 py-3 pl-3"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "Usage 覆盖率" : "Usage Coverage"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheUsageCoverage.toFixed(1)}%</strong><p className="text-copy-13 leading-5 text-fg-subtle">{formatNumber(data.usage_samples_24h)} / {formatNumber(cacheEligibleRequests)} {locale === "zh" ? "次请求" : "requests"}</p></div>
           </div>
         </section>
         <section aria-labelledby="capacity-heading" className="bg-surface px-4 py-5 sm:px-6 lg:px-8">

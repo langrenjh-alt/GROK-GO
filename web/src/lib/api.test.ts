@@ -10,7 +10,7 @@ describe("apiFetch", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { ok: true } }), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     await expect(apiFetch<{ ok: boolean }>("/health")).resolves.toEqual({ ok: true });
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/health`, expect.objectContaining({ credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/health`, expect.objectContaining({ cache: "no-store", credentials: "same-origin" }));
   });
 
   it("returns structured API failures", async () => {

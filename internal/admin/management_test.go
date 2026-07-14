@@ -224,9 +224,11 @@ func TestBatchUpdateAccountsPrevalidatesAndWritesAtomically(t *testing.T) {
 }
 
 type fakeAccountRepo struct {
-	values     map[string]*domain.Account
-	batchErr   error
-	batchCalls int
+	values           map[string]*domain.Account
+	batchErr         error
+	batchCalls       int
+	deleteBatchCalls int
+	deleteBatchIDs   []string
 }
 
 func (r *fakeAccountRepo) CreateAccount(_ context.Context, account *domain.Account) error {

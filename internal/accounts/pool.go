@@ -107,12 +107,13 @@ type Pool struct {
 	coordinator Coordinator
 	now         func() time.Time
 
-	mu         sync.Mutex
-	loaded     bool
-	states     map[string]*runtimeState
-	affinities map[string]affinityEntry
-	roundRobin map[string]uint64
-	notifier   configevent.Notifier
+	reloadToken chan struct{}
+	mu          sync.Mutex
+	loaded      bool
+	states      map[string]*runtimeState
+	affinities  map[string]affinityEntry
+	roundRobin  map[string]uint64
+	notifier    configevent.Notifier
 }
 
 // SetChangeNotifier publishes persistent account state changes to peer
@@ -157,15 +158,18 @@ func NewPoolWithCoordinator(store Store, policy Policy, coordinator Coordinator)
 	if policy.MaxAffinities <= 0 {
 		policy.MaxAffinities = defaults.MaxAffinities
 	}
-	return &Pool{
+	pool := &Pool{
 		store:       store,
 		policy:      policy,
 		coordinator: coordinator,
 		now:         time.Now,
+		reloadToken: make(chan struct{}, 1),
 		states:      make(map[string]*runtimeState),
 		affinities:  make(map[string]affinityEntry),
 		roundRobin:  make(map[string]uint64),
 	}
+	pool.reloadToken <- struct{}{}
+	return pool
 }
 
 func (p *Pool) Strategy() Strategy {
@@ -193,6 +197,16 @@ func (p *Pool) SetStrategy(strategy Strategy) error {
 // Reload reconciles persistent accounts while retaining per-process inflight
 // counters and health observations.
 func (p *Pool) Reload(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.reloadToken:
+	}
+	defer func() { p.reloadToken <- struct{}{} }()
+
 	items, err := p.store.ListAccounts(ctx)
 	if err != nil {
 		return err
@@ -222,8 +236,8 @@ func (p *Pool) Reload(ctx context.Context) error {
 			state.cooldownTill = time.Time{}
 		}
 	}
-	for id, state := range p.states {
-		if _, ok := seen[id]; !ok && state.inflight == 0 {
+	for id := range p.states {
+		if _, ok := seen[id]; !ok {
 			delete(p.states, id)
 		}
 	}
@@ -236,6 +250,30 @@ func (p *Pool) Reload(ctx context.Context) error {
 	p.loaded = true
 	p.mu.Unlock()
 	return nil
+}
+
+// RemoveAccounts immediately evicts accounts whose persistent deletion has
+// already committed. A later full Reload still reconciles the remaining pool.
+func (p *Pool) RemoveAccounts(accountIDs []string) {
+	removed := make(map[string]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID = strings.TrimSpace(accountID); accountID != "" {
+			removed[accountID] = struct{}{}
+		}
+	}
+	if len(removed) == 0 {
+		return
+	}
+	p.mu.Lock()
+	for accountID := range removed {
+		delete(p.states, accountID)
+	}
+	for key, affinity := range p.affinities {
+		if _, ok := removed[affinity.accountID]; ok {
+			delete(p.affinities, key)
+		}
+	}
+	p.mu.Unlock()
 }
 
 // ClearCooldown removes coordinated cooldown state after a caller has
@@ -273,6 +311,7 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 	for id := range selection.ExcludeIDs {
 		excluded[id] = struct{}{}
 	}
+	capacityExcluded := make(map[string]struct{})
 	for {
 		now := p.now()
 		p.mu.Lock()
@@ -284,6 +323,39 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 				delete(p.affinities, affinityKey(selection.Model.ID, selection.AffinityKey))
 			}
 		}
+		preferredAffinity := ""
+		preferredAtCapacity := false
+		staleAffinity := ""
+		leaseAffinityEstablished := false
+		if useAffinity {
+			key := affinityKey(selection.Model.ID, selection.AffinityKey)
+			if entry, ok := p.affinities[key]; ok && entry.expiresAt.After(now) {
+				preferredAffinity = entry.accountID
+				preferredState := p.states[entry.accountID]
+				if preferredState == nil || !p.durablyEligibleLocked(preferredState, selection.Model, now) {
+					staleAffinity = entry.accountID
+					preferredAffinity = ""
+					delete(p.affinities, key)
+				} else {
+					limit := preferredState.account.ConcurrencyLimit
+					if limit <= 0 {
+						limit = p.policy.DefaultConcurrency
+					}
+					_, coordinatedCapacityExhausted := capacityExcluded[entry.accountID]
+					preferredAtCapacity = preferredState.inflight >= limit || coordinatedCapacityExhausted
+				}
+			}
+		}
+		if staleAffinity != "" {
+			p.mu.Unlock()
+			if p.coordinator != nil && coordinatedAffinity == staleAffinity {
+				if err := p.coordinator.ClearAffinity(ctx, selection.Model.ID, selection.AffinityKey, staleAffinity); err != nil {
+					return nil, fmt.Errorf("clear unavailable account affinity: %w", err)
+				}
+				coordinatedAffinity = ""
+			}
+			continue
+		}
 		attempt := selection
 		attempt.ExcludeIDs = excluded
 		state := p.selectLocked(attempt, now)
@@ -294,6 +366,8 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 		state.inflight++
 		state.account.LastUsedAt = ptr(now)
 		account := state.account
+		affinityReused := preferredAffinity != "" && preferredAffinity == account.ID
+		preserveAffinity := preferredAffinity != "" && account.ID != preferredAffinity && preferredAtCapacity
 		p.mu.Unlock()
 
 		var coordinatedLease CoordinationLease
@@ -306,6 +380,13 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 			if coolingDown {
 				p.rollbackReservation(account.ID, until)
 				excluded[account.ID] = struct{}{}
+				if coordinatedAffinity != "" && account.ID == coordinatedAffinity {
+					p.clearLocalAffinity(selection.Model.ID, selection.AffinityKey, coordinatedAffinity)
+					if err := p.coordinator.ClearAffinity(ctx, selection.Model.ID, selection.AffinityKey, coordinatedAffinity); err != nil {
+						return nil, fmt.Errorf("clear cooling account affinity: %w", err)
+					}
+					coordinatedAffinity = ""
+				}
 				continue
 			}
 
@@ -321,6 +402,7 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 			if !acquired {
 				p.rollbackReservation(account.ID, time.Time{})
 				excluded[account.ID] = struct{}{}
+				capacityExcluded[account.ID] = struct{}{}
 				continue
 			}
 			coordinatedLease = lease
@@ -334,7 +416,7 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 			}
 			return nil, err
 		}
-		if coordinatedAffinity != "" && account.ID != coordinatedAffinity {
+		if coordinatedAffinity != "" && account.ID != coordinatedAffinity && !preserveAffinity {
 			if err := p.coordinator.ClearAffinity(ctx, selection.Model.ID, selection.AffinityKey, coordinatedAffinity); err != nil {
 				p.rollbackReservation(account.ID, time.Time{})
 				if p.coordinator != nil {
@@ -346,23 +428,59 @@ func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error)
 		}
 		if useAffinity {
 			affinityAccountID := account.ID
+			affinityEstablished := false
+			if preserveAffinity {
+				affinityAccountID = preferredAffinity
+			}
 			if p.coordinator != nil {
-				resolved, err := p.coordinator.BindAffinity(ctx, selection.Model.ID, selection.AffinityKey, account.ID, p.policy.AffinityTTL)
+				resolved, established, err := p.coordinator.BindAffinity(ctx, selection.Model.ID, selection.AffinityKey, account.ID, p.policy.AffinityTTL)
 				if err != nil {
 					p.rollbackReservation(account.ID, time.Time{})
 					releaseErr := p.coordinator.ReleaseLease(ctx, coordinatedLease)
 					return nil, errors.Join(fmt.Errorf("bind coordinated account affinity: %w", err), releaseErr)
 				}
 				affinityAccountID = resolved
+				affinityEstablished = established && resolved == account.ID
 				coordinatedAffinity = resolved
+			} else {
+				affinityEstablished = affinityAccountID == account.ID && !affinityReused
 			}
 			p.recordAffinity(selection.Model.ID, selection.AffinityKey, affinityAccountID, now)
+			leaseAffinityEstablished = affinityEstablished
 		}
-		lease := &Lease{pool: p, Account: account, Credentials: credentials}
+		lease := &Lease{
+			pool: p, Account: account, Credentials: credentials,
+			CacheIdentityApplied:     useAffinity,
+			AffinityReused:           affinityReused,
+			CacheAffinityEstablished: leaseAffinityEstablished,
+		}
+		if useAffinity {
+			lease.affinityModel = selection.Model.ID
+			lease.affinityKey = selection.AffinityKey
+		}
 		if p.coordinator != nil {
 			lease.coordination = &coordinatedLease
 		}
 		return lease, nil
+	}
+}
+
+func (p *Pool) clearLocalAffinity(model, key, accountID string) {
+	if model == "" || key == "" || accountID == "" {
+		return
+	}
+	p.mu.Lock()
+	p.clearLocalAffinityLocked(model, key, accountID)
+	p.mu.Unlock()
+}
+
+func (p *Pool) clearLocalAffinityLocked(model, key, accountID string) {
+	if model == "" || key == "" || accountID == "" {
+		return
+	}
+	mapKey := affinityKey(model, key)
+	if entry, ok := p.affinities[mapKey]; ok && entry.accountID == accountID {
+		delete(p.affinities, mapKey)
 	}
 }
 
@@ -462,6 +580,17 @@ func (p *Pool) selectLocked(selection Selection, now time.Time) *runtimeState {
 }
 
 func (p *Pool) eligibleLocked(state *runtimeState, model domain.ModelSpec, now time.Time) bool {
+	if !p.durablyEligibleLocked(state, model, now) {
+		return false
+	}
+	limit := state.account.ConcurrencyLimit
+	if limit <= 0 {
+		limit = p.policy.DefaultConcurrency
+	}
+	return state.inflight < limit
+}
+
+func (p *Pool) durablyEligibleLocked(state *runtimeState, model domain.ModelSpec, now time.Time) bool {
 	account := state.account
 	if account.Status == domain.AccountCooldown && !state.cooldownTill.After(now) {
 		account.Status = domain.AccountActive
@@ -471,11 +600,7 @@ func (p *Pool) eligibleLocked(state *runtimeState, model domain.ModelSpec, now t
 	if account.Status != domain.AccountActive || state.cooldownTill.After(now) {
 		return false
 	}
-	limit := account.ConcurrencyLimit
-	if limit <= 0 {
-		limit = p.policy.DefaultConcurrency
-	}
-	if state.inflight >= limit || !slices.Contains(model.CredentialKinds, account.Kind) {
+	if !slices.Contains(model.CredentialKinds, account.Kind) {
 		return false
 	}
 	if len(account.Models) > 0 && !slices.Contains(account.Models, model.ID) && !slices.Contains(account.Models, model.UpstreamModel) {
@@ -518,19 +643,42 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 	var accountToUpdate *domain.Account
 	var cooldownUntil time.Time
 	publishChange := false
+	invalidateAffinity := false
 	p.mu.Lock()
 	state := p.states[lease.Account.ID]
-	if state != nil {
+	if state == nil {
+		invalidateAffinity = true
+	} else {
 		if state.inflight > 0 {
 			state.inflight--
 		}
 		account := state.account
 		if !bytes.Equal(account.CredentialCipher, lease.Account.CredentialCipher) ||
 			!bytes.Equal(account.CredentialFingerprint, lease.Account.CredentialFingerprint) {
+			quotaUntil := quotaUnavailableUntil(account.Quota, now, p.policy.RateLimitCooldown[account.Kind])
+			unavailable := account.Status != domain.AccountActive || state.cooldownTill.After(now) || quotaUntil.After(now)
+			if unavailable {
+				p.clearLocalAffinityLocked(lease.affinityModel, lease.affinityKey, lease.Account.ID)
+			}
+			coordinatedUntil := state.cooldownTill
+			if quotaUntil.After(coordinatedUntil) {
+				coordinatedUntil = quotaUntil
+			}
+			if isTerminalAccountStatus(account.Status) && !coordinatedUntil.After(now) {
+				coordinatedUntil = now.Add(p.policy.ForbiddenCooldown)
+			}
 			p.mu.Unlock()
 			var result error
+			if p.coordinator != nil && unavailable {
+				if coordinatedUntil.After(now) {
+					result = errors.Join(result, p.coordinator.SetCooldown(ctx, lease.Account.ID, coordinatedUntil))
+				}
+				if lease.affinityModel != "" && lease.affinityKey != "" {
+					result = errors.Join(result, p.coordinator.ClearAffinity(ctx, lease.affinityModel, lease.affinityKey, lease.Account.ID))
+				}
+			}
 			if p.coordinator != nil && lease.coordination != nil {
-				result = p.coordinator.ReleaseLease(ctx, *lease.coordination)
+				result = errors.Join(result, p.coordinator.ReleaseLease(ctx, *lease.coordination))
 			}
 			return result
 		}
@@ -549,7 +697,10 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 		quotaReset, quotaExhausted := exhaustedQuotaReset(account.Quota, account.Kind, p.policy, now, feedback.Quota != nil)
 		switch {
 		case terminalStateChanged:
+			invalidateAffinity = true
+			cooldownUntil = now.Add(p.policy.ForbiddenCooldown)
 		case feedback.StatusCode == 429:
+			invalidateAffinity = true
 			persist = true
 			publishChange = true
 			state.health = math.Max(.05, state.health*.45)
@@ -574,6 +725,7 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 			account.CooldownUntil = ptr(candidate)
 			account.LastError = feedbackMessage(feedback)
 		case isPermanentCredentialFailure(feedback.StatusCode):
+			invalidateAffinity = true
 			persist = true
 			publishChange = true
 			state.health = math.Max(.05, state.health*.25)
@@ -582,7 +734,9 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 			account.Status = domain.AccountDisabled
 			account.CooldownUntil = nil
 			account.LastError = feedbackMessage(feedback)
+			cooldownUntil = now.Add(p.policy.ForbiddenCooldown)
 		case quotaExhausted:
+			invalidateAffinity = true
 			persist = true
 			publishChange = true
 			state.health = math.Max(.05, state.health*.9)
@@ -598,6 +752,8 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 		case feedback.StatusCode >= 200 && feedback.StatusCode < 400 && feedback.Err == nil && concurrentCooldown:
 			// A request acquired before a concurrent failure must not erase its
 			// unexpired cooldown when that older request later succeeds.
+			invalidateAffinity = true
+			cooldownUntil = state.cooldownTill
 		case feedback.StatusCode >= 200 && feedback.StatusCode < 400 && feedback.Err == nil:
 			recovering := state.health < 1 || state.failures != 0 || account.Status != domain.AccountActive || account.CooldownUntil != nil || account.LastError != ""
 			state.health = math.Min(1, state.health+0.12)
@@ -613,6 +769,7 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 		case feedback.StatusCode == 499:
 			// Client cancellation is not an upstream health failure.
 		case feedback.Err != nil || feedback.StatusCode >= 500:
+			invalidateAffinity = true
 			persist = true
 			publishChange = true
 			state.health = math.Max(.05, state.health*.75)
@@ -631,18 +788,32 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 			accountToUpdate = ptr(account)
 		}
 	}
+	if invalidateAffinity {
+		p.clearLocalAffinityLocked(lease.affinityModel, lease.affinityKey, lease.Account.ID)
+	}
 	p.mu.Unlock()
 
 	var result error
+	if p.coordinator != nil {
+		if !cooldownUntil.IsZero() {
+			result = errors.Join(result, p.coordinator.SetCooldown(ctx, lease.Account.ID, cooldownUntil))
+		}
+		if invalidateAffinity && lease.affinityModel != "" && lease.affinityKey != "" {
+			result = errors.Join(result, p.coordinator.ClearAffinity(ctx, lease.affinityModel, lease.affinityKey, lease.Account.ID))
+		}
+	}
+	readyToNotify := false
 	if accountToUpdate != nil {
 		if err := p.store.UpdateAccount(ctx, *accountToUpdate); err != nil {
 			result = errors.Join(result, err)
 		} else if publishChange {
 			if err := p.Reload(ctx); err != nil {
 				result = errors.Join(result, err)
+			} else {
+				readyToNotify = true
 			}
 		}
-		if publishChange && result == nil {
+		if publishChange && readyToNotify {
 			p.mu.Lock()
 			notifier := p.notifier
 			p.mu.Unlock()
@@ -652,9 +823,6 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 		}
 	}
 	if p.coordinator != nil && lease.coordination != nil {
-		if !cooldownUntil.IsZero() {
-			result = errors.Join(result, p.coordinator.SetCooldown(ctx, lease.Account.ID, cooldownUntil))
-		}
 		result = errors.Join(result, p.coordinator.ReleaseLease(ctx, *lease.coordination))
 	}
 	return result
@@ -796,12 +964,17 @@ func itoa(v int) string {
 func ptr[T any](value T) *T { return &value }
 
 type Lease struct {
-	Account      domain.Account
-	Credentials  domain.Credentials
-	pool         *Pool
-	coordination *CoordinationLease
-	once         sync.Once
-	releaseErr   error
+	Account                  domain.Account
+	Credentials              domain.Credentials
+	CacheIdentityApplied     bool
+	AffinityReused           bool
+	CacheAffinityEstablished bool
+	pool                     *Pool
+	coordination             *CoordinationLease
+	affinityModel            string
+	affinityKey              string
+	once                     sync.Once
+	releaseErr               error
 }
 
 func (l *Lease) Release(ctx context.Context, feedback Feedback) error {

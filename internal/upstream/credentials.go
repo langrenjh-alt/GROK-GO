@@ -68,6 +68,11 @@ func (CLIOAuthAdapter) Apply(request *http.Request, credentials domain.Credentia
 	request.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	request.Header.Set("X-Grok-Client-Version", "0.2.93")
 	request.Header.Set("X-Grok-Client-Identifier", "grok-shell")
+	userAgent := strings.TrimSpace(credentials.UserAgent)
+	if userAgent == "" {
+		userAgent = "xai-grok-workspace/0.2.93"
+	}
+	request.Header.Set("User-Agent", userAgent)
 	return nil
 }
 

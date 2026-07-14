@@ -21,7 +21,7 @@ type Coordinator interface {
 	AcquireLease(context.Context, string, int, time.Duration) (CoordinationLease, bool, error)
 	ReleaseLease(context.Context, CoordinationLease) error
 	GetAffinity(context.Context, string, string) (string, bool, error)
-	BindAffinity(context.Context, string, string, string, time.Duration) (string, error)
+	BindAffinity(context.Context, string, string, string, time.Duration) (string, bool, error)
 	ClearAffinity(context.Context, string, string, string) error
 	CooldownUntil(context.Context, string) (time.Time, bool, error)
 	SetCooldown(context.Context, string, time.Time) error
@@ -144,45 +144,45 @@ func (c *RedisCoordinator) GetAffinity(ctx context.Context, model, affinity stri
 
 // BindAffinity atomically creates a mapping and returns the winning account ID
 // when another process created the same mapping concurrently.
-func (c *RedisCoordinator) BindAffinity(ctx context.Context, model, affinity, accountID string, ttl time.Duration) (string, error) {
+func (c *RedisCoordinator) BindAffinity(ctx context.Context, model, affinity, accountID string, ttl time.Duration) (string, bool, error) {
 	if c == nil || c.redis == nil {
-		return "", errors.New("account coordinator is not configured")
+		return "", false, errors.New("account coordinator is not configured")
 	}
 	if accountID == "" {
-		return "", errors.New("account affinity requires an account ID")
+		return "", false, errors.New("account affinity requires an account ID")
 	}
 	if ttl <= 0 {
-		return "", errors.New("account affinity TTL must be positive")
+		return "", false, errors.New("account affinity TTL must be positive")
 	}
 	key := c.affinityKey(model, affinity)
 	for attempt := 0; attempt < 3; attempt++ {
 		created, err := c.redis.SetNX(ctx, key, []byte(accountID), ttl)
 		if err != nil {
-			return "", fmt.Errorf("bind account affinity: %w", err)
+			return "", false, fmt.Errorf("bind account affinity: %w", err)
 		}
 		if created {
-			return accountID, nil
+			return accountID, true, nil
 		}
 		value, err := c.redis.Get(ctx, key)
 		if errors.Is(err, database.ErrCacheMiss) {
 			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("read bound account affinity: %w", err)
+			return "", false, fmt.Errorf("read bound account affinity: %w", err)
 		}
 		if len(value) == 0 {
-			return "", errors.New("bound account affinity is empty")
+			return "", false, errors.New("bound account affinity is empty")
 		}
 		refreshed, err := c.redis.CompareExpire(ctx, key, value, ttl)
 		if err != nil {
-			return "", fmt.Errorf("refresh bound account affinity: %w", err)
+			return "", false, fmt.Errorf("refresh bound account affinity: %w", err)
 		}
 		if !refreshed {
 			continue
 		}
-		return string(value), nil
+		return string(value), false, nil
 	}
-	return "", errors.New("account affinity changed while binding")
+	return "", false, errors.New("account affinity changed while binding")
 }
 
 func (c *RedisCoordinator) ClearAffinity(ctx context.Context, model, affinity, accountID string) error {

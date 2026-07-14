@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -78,9 +79,40 @@ func TestSub2APIAccountImportSupportsTaggedAndLegacyEnvelopes(t *testing.T) {
 	delete(payload, "type")
 	delete(payload, "version")
 	delete(payload, "exported_at")
-	legacy, _ := json.Marshal(map[string]any{"data": payload, "skip_default_group_bind": true})
+	legacy, _ := json.Marshal(map[string]any{
+		"data": payload, "skip_default_group_bind": true,
+		"initial_status": "active", "post_import_action": "refresh_probe",
+	})
 	if parsed, err = parseImportData(legacy); err != nil || len(parsed.Accounts) != 1 {
 		t.Fatalf("wrapped legacy sub2api = %+v, %v", parsed, err)
+	}
+	if parsed.InitialStatus != domain.AccountActive || parsed.PostImportAction != "refresh_probe" {
+		t.Fatalf("wrapped sub2api controls = %+v", parsed)
+	}
+}
+
+func TestSub2APIAccountImportAcceptsHistoricalCredentialExpirationFormats(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(4 * time.Hour).Truncate(time.Second)
+	for _, expiry := range []any{expiresAt.Unix(), strconv.FormatInt(expiresAt.Unix(), 10)} {
+		payload := map[string]any{
+			"type": "sub2api-data", "version": 1, "proxies": []any{},
+			"accounts": []any{map[string]any{
+				"name": "Historical Grok", "platform": "grok", "type": "oauth",
+				"credentials": map[string]any{
+					"access_token": "historical-access", "refresh_token": "historical-refresh",
+					"token_type": "Bearer", "expires_at": expiry,
+				},
+				"concurrency": 1, "priority": 0,
+			}},
+		}
+		content, _ := json.Marshal(payload)
+		parsed, err := parseImportData(content)
+		if err != nil {
+			t.Fatalf("expiry %v: %v", expiry, err)
+		}
+		if len(parsed.Accounts) != 1 || parsed.Accounts[0].Credentials == nil || !parsed.Accounts[0].Credentials.ExpiresAt.Equal(expiresAt) {
+			t.Fatalf("expiry %v parsed as %+v", expiry, parsed)
+		}
 	}
 }
 
@@ -136,5 +168,33 @@ func TestGrok2APITopLevelTokenArrayPreservesAccountState(t *testing.T) {
 	}
 	if second.Tier != "heavy" || second.Status != domain.AccountDisabled || len(second.Tags) != 1 || second.Tags[0] != "two" {
 		t.Fatalf("grok2api disabled account = %+v", second)
+	}
+}
+
+func TestGrok2APIListResponseAcceptsPaginationMetadata(t *testing.T) {
+	parsed, err := parseImportData([]byte(`{
+		"tokens":[{"token":"paged-token","pool":"basic","status":"active"}],
+		"total":1,"page":1,"page_size":20,"total_pages":1
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Accounts) != 0 || len(parsed.Tokens) != 1 || parsed.Tokens[0].Token != "paged-token" {
+		t.Fatalf("grok2api paged import = %+v", parsed)
+	}
+}
+
+func TestCPAImportAcceptsUnixExpiration(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+	payload, _ := json.Marshal(map[string]any{
+		"type": "xai", "auth_kind": "oauth", "access_token": "cpa-access",
+		"refresh_token": "cpa-refresh", "expires_at": expiresAt.Unix(),
+	})
+	parsed, err := parseImportData(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Accounts) != 1 || parsed.Accounts[0].Credentials == nil || !parsed.Accounts[0].Credentials.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("CPA Unix expiration import = %+v", parsed)
 	}
 }

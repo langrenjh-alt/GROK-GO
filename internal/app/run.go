@@ -216,11 +216,14 @@ func Run(ctx context.Context) error {
 		},
 		OnCompletion: func(ctx context.Context, completion gateway.Completion) {
 			apikey.ReportCompletion(ctx, apikey.Completion{
-				AccountID:    completion.AccountID,
-				InputTokens:  completion.Usage.InputTokens,
-				OutputTokens: completion.Usage.OutputTokens,
-				CachedTokens: completion.Usage.CachedTokens,
-				UsageParsed:  completion.UsageParsed,
+				AccountID:                completion.AccountID,
+				InputTokens:              completion.Usage.InputTokens,
+				OutputTokens:             completion.Usage.OutputTokens,
+				CachedTokens:             completion.Usage.CachedTokens,
+				UsageParsed:              completion.UsageParsed,
+				CacheIdentityApplied:     completion.CacheIdentityApplied,
+				CacheAffinityReused:      completion.CacheAffinityReused,
+				CacheAffinityEstablished: completion.CacheAffinityEstablished,
 			})
 		},
 	})

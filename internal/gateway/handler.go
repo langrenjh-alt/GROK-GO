@@ -40,9 +40,12 @@ type Config struct {
 // Completion is emitted once the selected upstream response has finished. A
 // usage value is billable only when UsageParsed is true.
 type Completion struct {
-	AccountID   string
-	Usage       upstream.Usage
-	UsageParsed bool
+	AccountID                string
+	Usage                    upstream.Usage
+	UsageParsed              bool
+	CacheIdentityApplied     bool
+	CacheAffinityReused      bool
+	CacheAffinityEstablished bool
 }
 
 type Handler struct {
@@ -169,8 +172,8 @@ func (h *Handler) handleOperation(w http.ResponseWriter, r *http.Request, operat
 		return
 	}
 	stream, _ := payload["stream"].(bool)
-	cacheIdentity := affinityIdentity(r, model.ID, payload)
-	response, lease, err := h.invoke(r.Context(), operation, model, body, r.Header, stream, cacheIdentity)
+	cacheIdentity := requestCacheIdentities(r, model.ID, payload)
+	response, lease, err := h.invoke(r.Context(), operation, model, body, r.Header, stream, cacheIdentity.SessionAffinityKey, cacheIdentity.PromptCacheKey)
 	if err != nil {
 		status := http.StatusBadGateway
 		code := "upstream_error"
@@ -201,11 +204,14 @@ func (h *Handler) reportCompletion(ctx context.Context, lease *accounts.Lease, v
 	completion := Completion{Usage: value, UsageParsed: parsed}
 	if lease != nil {
 		completion.AccountID = lease.Account.ID
+		completion.CacheIdentityApplied = lease.CacheIdentityApplied
+		completion.CacheAffinityReused = lease.AffinityReused
+		completion.CacheAffinityEstablished = lease.CacheAffinityEstablished
 	}
 	h.config.OnCompletion(ctx, completion)
 }
 
-func (h *Handler) invoke(ctx context.Context, operation upstream.Operation, model domain.ModelSpec, body json.RawMessage, headers http.Header, stream bool, affinity string) (*upstream.Response, *accounts.Lease, error) {
+func (h *Handler) invoke(ctx context.Context, operation upstream.Operation, model domain.ModelSpec, body json.RawMessage, headers http.Header, stream bool, affinity, promptCacheKey string) (*upstream.Response, *accounts.Lease, error) {
 	excluded := make(map[string]struct{})
 	refreshed := make(map[string]struct{})
 	var lastErr error
@@ -227,7 +233,7 @@ func (h *Handler) invoke(ctx context.Context, operation upstream.Operation, mode
 				continue
 			}
 		}
-		response, err := h.config.Upstream.Do(ctx, upstream.Request{Operation: operation, Model: model.ID, UpstreamModel: model.UpstreamModel, PromptCacheKey: affinity, CredentialKind: lease.Account.Kind, Credentials: lease.Credentials, ProxyURL: proxyURL, Body: body, Headers: forwardedHeaders(headers), Stream: stream})
+		response, err := h.config.Upstream.Do(ctx, upstream.Request{Operation: operation, Model: model.ID, UpstreamModel: model.UpstreamModel, PromptCacheKey: promptCacheKey, CredentialKind: lease.Account.Kind, Credentials: lease.Credentials, ProxyURL: proxyURL, Body: body, Headers: forwardedHeaders(headers), Stream: stream})
 		if err != nil {
 			lastErr = err
 			excluded[lease.Account.ID] = struct{}{}
@@ -365,10 +371,6 @@ func isConversational(operation upstream.Operation) bool {
 	return operation == upstream.OperationChat || operation == upstream.OperationResponses || operation == upstream.OperationMessages
 }
 
-func affinityIdentity(r *http.Request, model string, payload map[string]any) string {
-	return promptCacheIdentity(r.Header, model, payload)
-}
-
 func forwardedHeaders(source http.Header) http.Header {
 	result := make(http.Header)
 	for _, key := range []string{"X-Grok-Conv-Id", "X-Claude-Code-Session-Id", "X-Request-Id"} {
@@ -400,6 +402,13 @@ func retryAfter(header http.Header) time.Duration {
 func feedbackFromResponse(response *upstream.Response, err error) accounts.Feedback {
 	if response == nil {
 		return accounts.Feedback{StatusCode: http.StatusBadGateway, Err: err}
+	}
+	if isUpstreamProtectionChallenge(response) {
+		return accounts.Feedback{
+			RetryAfter: retryAfter(response.Header),
+			Quota:      quotaFromHeaders(response.Header, time.Now().UTC()),
+			Err:        errors.New(upstreamProtectionChallengeMessage(response.StatusCode)),
+		}
 	}
 	return accounts.Feedback{
 		StatusCode: response.StatusCode,
@@ -514,6 +523,9 @@ func upstreamErrorMessage(response *upstream.Response) string {
 	if response == nil {
 		return "upstream request failed"
 	}
+	if isUpstreamProtectionChallenge(response) {
+		return upstreamProtectionChallengeMessage(response.StatusCode)
+	}
 	if len(response.Body) > 0 {
 		var payload map[string]any
 		if json.Unmarshal(response.Body, &payload) == nil {
@@ -529,6 +541,31 @@ func upstreamErrorMessage(response *upstream.Response) string {
 		return strings.TrimSpace(string(response.Body))
 	}
 	return fmt.Sprintf("upstream returned status %d", response.StatusCode)
+}
+
+func upstreamProtectionChallengeMessage(statusCode int) string {
+	return fmt.Sprintf("upstream protection challenge returned HTTP %d; check the account proxy and retry", statusCode)
+}
+
+func isUpstreamProtectionChallenge(response *upstream.Response) bool {
+	if response == nil || response.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(response.Header.Get("CF-Mitigated")), "challenge") {
+		return true
+	}
+	lowerBody := strings.ToLower(string(response.Body))
+	if strings.Contains(lowerBody, "challenges.cloudflare.com") ||
+		strings.Contains(lowerBody, "cf-chl-") ||
+		strings.Contains(lowerBody, "<title>just a moment...</title>") {
+		return true
+	}
+	if !strings.Contains(strings.ToLower(response.Header.Get("Server")), "cloudflare") {
+		return false
+	}
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	trimmedBody := bytes.TrimSpace(response.Body)
+	return strings.Contains(contentType, "text/html") || bytes.HasPrefix(bytes.ToLower(trimmedBody), []byte("<!doctype html")) || bytes.HasPrefix(bytes.ToLower(trimmedBody), []byte("<html"))
 }
 
 func mapStatus(status int) int {

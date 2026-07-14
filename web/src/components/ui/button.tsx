@@ -53,16 +53,17 @@ interface IconButtonProps extends Omit<ButtonProps, "children" | "aria-label"> {
 }
 
 export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
-  ({ label, children, size = "small", className, ...props }, ref) => (
+  ({ label, children, size = "small", className, loading, ...props }, ref) => (
     <Button
       ref={ref}
       aria-label={label}
       title={label}
       size={size}
       className={cn("aspect-square px-0", className)}
+      loading={loading}
       {...props}
     >
-      {children}
+      {loading ? null : children}
     </Button>
   ),
 );

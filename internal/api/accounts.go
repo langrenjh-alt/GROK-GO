@@ -6,20 +6,30 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/langrenjh-alt/GROK-GO/internal/accountprobe"
 	accountpool "github.com/langrenjh-alt/GROK-GO/internal/accounts"
 	"github.com/langrenjh-alt/GROK-GO/internal/admin"
 	"github.com/langrenjh-alt/GROK-GO/internal/configevent"
 	"github.com/langrenjh-alt/GROK-GO/internal/domain"
 	"github.com/langrenjh-alt/GROK-GO/internal/store"
+)
+
+const (
+	accountDeleteSyncTimeout          = 5 * time.Second
+	accountImportActionTimeout        = 60 * time.Second
+	accountImportCleanupTimeout       = 15 * time.Second
+	accountImportActionMaxConcurrency = 5
 )
 
 type accountRequest struct {
@@ -97,6 +107,7 @@ func (h *Handler) mountAccounts(router chi.Router) {
 	router.Put("/accounts/policy", h.updateAccountPolicy)
 	router.Patch("/accounts/policy", h.updateAccountPolicy)
 	router.Patch("/accounts/batch", h.batchUpdateAccounts)
+	router.Post("/accounts/batch-delete", h.batchDeleteAccounts)
 	router.Post("/accounts/probe", h.batchProbeAccounts)
 	router.Post("/accounts/test", h.batchProbeAccounts)
 	router.Post("/accounts/{id}/probe", h.probeAccount)
@@ -163,6 +174,31 @@ func (h *Handler) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeData(w, http.StatusOK, map[string]any{"updated": len(items), "items": items})
+}
+
+func (h *Handler) batchDeleteAccounts(w http.ResponseWriter, r *http.Request) {
+	if !h.requireManagement(w) {
+		return
+	}
+	var request struct {
+		IDs []string `json:"ids"`
+	}
+	if err := h.decodeJSON(w, r, &request); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	request.IDs = uniqueStrings(request.IDs)
+	if len(request.IDs) == 0 || len(request.IDs) > 500 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_account_batch", "Select between 1 and 500 accounts.")
+		return
+	}
+	deleted, err := h.config.Management.DeleteAccounts(r.Context(), request.IDs)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	h.syncDeletedAccounts(r.Context(), request.IDs)
+	writeData(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
 func (h *Handler) getAccountPolicy(w http.ResponseWriter, _ *http.Request) {
@@ -355,7 +391,25 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 	if !h.requireManagement(w) {
 		return
 	}
-	filter := store.AccountFilter{Pagination: pagination(r), Query: r.URL.Query().Get("q"), Kind: domain.CredentialKind(r.URL.Query().Get("kind")), Status: domain.AccountStatus(r.URL.Query().Get("status")), Model: r.URL.Query().Get("model")}
+	query := r.URL.Query()
+	var proxyID *string
+	if query.Has("proxy_id") {
+		value := strings.TrimSpace(query.Get("proxy_id"))
+		switch strings.ToLower(value) {
+		case "direct", "none", "unbound":
+			value = ""
+		}
+		proxyID = &value
+	}
+	filter := store.AccountFilter{
+		Pagination: pagination(r),
+		Query:      query.Get("q"),
+		Kind:       domain.CredentialKind(query.Get("kind")),
+		Status:     domain.AccountStatus(query.Get("status")),
+		Tier:       query.Get("tier"),
+		ProxyID:    proxyID,
+		Model:      query.Get("model"),
+	}
 	items, err := h.config.Management.ListAccountsWithCredentialExpiry(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
@@ -442,14 +496,12 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !h.requireManagement(w) {
 		return
 	}
-	if err := h.config.Management.DeleteAccount(r.Context(), chi.URLParam(r, "id")); err != nil {
+	accountID := chi.URLParam(r, "id")
+	if err := h.config.Management.DeleteAccount(r.Context(), accountID); err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	if err := h.reloadAccounts(r.Context()); err != nil {
-		writeServiceError(w, err)
-		return
-	}
+	h.syncDeletedAccounts(r.Context(), []string{accountID})
 	writeData(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
@@ -609,6 +661,43 @@ type importRequest struct {
 	Tags             []string              `json:"tags"`
 	Priority         int                   `json:"priority"`
 	ConcurrencyLimit int                   `json:"concurrency_limit"`
+	InitialStatus    domain.AccountStatus  `json:"initial_status"`
+	Status           domain.AccountStatus  `json:"status"`
+	PostImportAction string                `json:"post_import_action"`
+	Total            int                   `json:"total,omitempty"`
+	Page             int                   `json:"page,omitempty"`
+	PageSize         int                   `json:"page_size,omitempty"`
+	TotalPages       int                   `json:"total_pages,omitempty"`
+}
+
+type importAccountActionResult struct {
+	AccountID string               `json:"account_id"`
+	Action    string               `json:"action"`
+	Refreshed bool                 `json:"refreshed"`
+	Probed    bool                 `json:"probed"`
+	Success   bool                 `json:"success"`
+	Status    domain.AccountStatus `json:"status,omitempty"`
+	Message   string               `json:"message,omitempty"`
+	Probe     *accountprobe.Result `json:"probe,omitempty"`
+}
+
+type importPostActionResult struct {
+	Action    string                      `json:"action"`
+	Total     int                         `json:"total"`
+	Succeeded int                         `json:"succeeded"`
+	Failed    int                         `json:"failed"`
+	Items     []importAccountActionResult `json:"items"`
+}
+
+type accountImportResult struct {
+	Status     string                  `json:"status"`
+	Count      int                     `json:"count"`
+	Imported   int                     `json:"imported"`
+	Skipped    int                     `json:"skipped"`
+	Failed     int                     `json:"failed"`
+	Items      []domain.Account        `json:"items"`
+	Errors     []string                `json:"errors,omitempty"`
+	PostAction *importPostActionResult `json:"post_action,omitempty"`
 }
 
 type buildOAuthImportRecord struct {
@@ -621,6 +710,7 @@ type buildOAuthImportRecord struct {
 	IDToken       string          `json:"id_token"`
 	TokenType     string          `json:"token_type"`
 	ExpiresIn     *int64          `json:"expires_in"`
+	ExpiresAt     json.RawMessage `json:"expires_at"`
 	Expired       string          `json:"expired"`
 	LastRefresh   string          `json:"last_refresh"`
 	RedirectURI   string          `json:"redirect_uri"`
@@ -645,6 +735,17 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	applyImportQueryOptions(r, &request)
+	initialStatus, err := normalizeImportInitialStatus(firstNonEmpty(string(request.InitialStatus), string(request.Status)))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_initial_status", err.Error())
+		return
+	}
+	postImportAction, err := normalizePostImportAction(request.PostImportAction)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_post_import_action", err.Error())
+		return
+	}
 	if request.Token != "" {
 		request.Tokens = append(request.Tokens, importCredentialsFromText(request.Token)...)
 	}
@@ -661,6 +762,9 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 		request.Accounts = append(request.Accounts, importedCredentialAccount(credential, request.Kind, firstNonEmpty(credential.Tier, tier), request))
 	}
 	applyImportDefaults(&request, tier)
+	if initialStatus != "" {
+		applyImportStatusOverride(request.Accounts, initialStatus, time.Now().UTC())
+	}
 	if len(request.Accounts) == 0 {
 		writeAPIError(w, http.StatusBadRequest, "empty_import", "No accounts or tokens were supplied.")
 		return
@@ -685,17 +789,17 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 			seenCredentials[string(fingerprint)] = struct{}{}
 		}
 	}
-	result := struct {
-		Status   string           `json:"status"`
-		Count    int              `json:"count"`
-		Imported int              `json:"imported"`
-		Skipped  int              `json:"skipped"`
-		Failed   int              `json:"failed"`
-		Items    []domain.Account `json:"items"`
-		Errors   []string         `json:"errors,omitempty"`
-	}{Status: "success"}
+	result := accountImportResult{Status: "success"}
+	var importedCLIAccountIDs []string
 	for _, item := range request.Accounts {
 		input := item.createInput()
+		if postImportAction == "refresh_probe" && input.Kind == domain.CredentialCLIOAuth && input.Status != domain.AccountDisabled {
+			// Keep unverified credentials outside the scheduler until the probe
+			// persists its success feedback.
+			input.Status = domain.AccountError
+			input.CooldownUntil = nil
+			input.LastError = "post-import credential verification is pending"
+		}
 		fingerprint := h.config.Management.AccountCredentialFingerprint(input.Kind, input.Credentials)
 		if len(fingerprint) > 0 {
 			if _, duplicate := seenCredentials[string(fingerprint)]; duplicate {
@@ -717,6 +821,9 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 		result.Imported++
 		result.Count++
 		result.Items = append(result.Items, *created)
+		if created.Kind == domain.CredentialCLIOAuth && created.Status != domain.AccountDisabled {
+			importedCLIAccountIDs = append(importedCLIAccountIDs, created.ID)
+		}
 		if len(fingerprint) > 0 {
 			seenCredentials[string(fingerprint)] = struct{}{}
 		}
@@ -725,6 +832,23 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 		if err := h.reloadAccounts(r.Context()); err != nil {
 			writeServiceError(w, err)
 			return
+		}
+	}
+	if postImportAction != "none" {
+		result.PostAction = h.runImportPostAction(r.Context(), postImportAction, importedCLIAccountIDs)
+		readContext, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), accountImportCleanupTimeout)
+		defer cancel()
+		actionResults := make(map[string]importAccountActionResult, len(result.PostAction.Items))
+		for _, actionResult := range result.PostAction.Items {
+			actionResults[actionResult.AccountID] = actionResult
+		}
+		for index := range result.Items {
+			if refreshed, getErr := h.config.Management.GetAccount(readContext, result.Items[index].ID); getErr == nil {
+				if actionResult, ok := actionResults[refreshed.ID]; ok && !actionResult.Success && actionResult.Message != "" {
+					refreshed.LastError = actionResult.Message
+				}
+				result.Items[index] = *refreshed
+			}
 		}
 	}
 	writeData(w, http.StatusOK, result)
@@ -760,6 +884,9 @@ func (h *Handler) decodeImportRequest(w http.ResponseWriter, r *http.Request, de
 	destination.Pool = r.FormValue("pool")
 	destination.Priority, _ = strconv.Atoi(r.FormValue("priority"))
 	destination.ConcurrencyLimit, _ = strconv.Atoi(r.FormValue("concurrency_limit"))
+	destination.InitialStatus = domain.AccountStatus(strings.TrimSpace(r.FormValue("initial_status")))
+	destination.Status = domain.AccountStatus(strings.TrimSpace(r.FormValue("status")))
+	destination.PostImportAction = strings.TrimSpace(r.FormValue("post_import_action"))
 	destination.Tags = splitCredentials(r.FormValue("tags"))
 	destination.Tokens = append(destination.Tokens, importCredentialsFromText(r.FormValue("tokens"))...)
 	if token := strings.TrimSpace(r.FormValue("token")); token != "" {
@@ -833,7 +960,20 @@ func parseImportObject(data []byte) (importRequest, error) {
 		if err != nil {
 			return importRequest{}, err
 		}
-		return importRequest{Accounts: []accountRequest{account}}, nil
+		var controls struct {
+			InitialStatus    domain.AccountStatus `json:"initial_status"`
+			Status           domain.AccountStatus `json:"status"`
+			PostImportAction string               `json:"post_import_action"`
+		}
+		if err := json.Unmarshal(data, &controls); err != nil {
+			return importRequest{}, err
+		}
+		return importRequest{
+			Accounts:         []accountRequest{account},
+			InitialStatus:    controls.InitialStatus,
+			Status:           controls.Status,
+			PostImportAction: controls.PostImportAction,
+		}, nil
 	}
 
 	accountsData, hasAccounts := object["accounts"]
@@ -1008,6 +1148,24 @@ func buildOAuthExpiry(record buildOAuthImportRecord) (time.Time, error) {
 		}
 		return expiresAt, nil
 	}
+	if value := bytes.TrimSpace(record.ExpiresAt); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
+		var unixSeconds int64
+		if err := json.Unmarshal(value, &unixSeconds); err == nil {
+			if unixSeconds <= 0 {
+				return time.Time{}, errors.New("OAuth import record has an invalid expiration time")
+			}
+			return time.Unix(unixSeconds, 0).UTC(), nil
+		}
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return time.Time{}, errors.New("OAuth import record has an invalid expiration time")
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(text))
+		if err != nil {
+			return time.Time{}, errors.New("OAuth import record has an invalid expiration time")
+		}
+		return expiresAt, nil
+	}
 	if record.ExpiresIn != nil && *record.ExpiresIn > 0 && strings.TrimSpace(record.LastRefresh) != "" {
 		if *record.ExpiresIn > int64((time.Duration(1<<63-1))/time.Second) {
 			return time.Time{}, errors.New("OAuth import record expiration interval is invalid")
@@ -1082,6 +1240,317 @@ func mergeImportRequest(destination *importRequest, source importRequest) {
 	if destination.ConcurrencyLimit == 0 {
 		destination.ConcurrencyLimit = source.ConcurrencyLimit
 	}
+	if destination.InitialStatus == "" {
+		destination.InitialStatus = source.InitialStatus
+	}
+	if destination.Status == "" {
+		destination.Status = source.Status
+	}
+	if destination.PostImportAction == "" {
+		destination.PostImportAction = source.PostImportAction
+	}
+}
+
+func applyImportQueryOptions(r *http.Request, request *importRequest) {
+	if r == nil || request == nil {
+		return
+	}
+	query := r.URL.Query()
+	if value := strings.TrimSpace(query.Get("initial_status")); value != "" {
+		request.InitialStatus = domain.AccountStatus(value)
+		request.Status = ""
+	} else if value := strings.TrimSpace(query.Get("status")); value != "" {
+		request.InitialStatus = domain.AccountStatus(value)
+		request.Status = ""
+	}
+	if value := strings.TrimSpace(query.Get("post_import_action")); value != "" {
+		request.PostImportAction = value
+	}
+}
+
+func normalizeImportInitialStatus(value string) (domain.AccountStatus, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "", nil
+	}
+	if value == "cooling" {
+		value = string(domain.AccountCooldown)
+	}
+	status := domain.AccountStatus(value)
+	if !apiAccountStatusValid(status) {
+		return "", errors.New("initial_status must be active, cooldown, expired, disabled, or error")
+	}
+	return status, nil
+}
+
+func normalizePostImportAction(value string) (string, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(value)); normalized {
+	case "", "none":
+		return "none", nil
+	case "refresh", "refresh_probe":
+		return normalized, nil
+	default:
+		return "", errors.New("post_import_action must be none, refresh, or refresh_probe")
+	}
+}
+
+func applyImportStatusOverride(accounts []accountRequest, status domain.AccountStatus, now time.Time) {
+	for index := range accounts {
+		accounts[index].Status = status
+		accounts[index].Disabled = status == domain.AccountDisabled
+		switch status {
+		case domain.AccountCooldown:
+			if accounts[index].CooldownUntil == nil || !accounts[index].CooldownUntil.After(now) {
+				until := now.Add(15 * time.Minute)
+				accounts[index].CooldownUntil = &until
+			}
+		case domain.AccountActive:
+			accounts[index].CooldownUntil = nil
+			accounts[index].LastError = ""
+		default:
+			accounts[index].CooldownUntil = nil
+		}
+	}
+}
+
+func (h *Handler) runImportPostAction(parent context.Context, action string, accountIDs []string) *importPostActionResult {
+	result := &importPostActionResult{
+		Action: action,
+		Total:  len(accountIDs),
+		Items:  make([]importAccountActionResult, len(accountIDs)),
+	}
+	for index, accountID := range accountIDs {
+		result.Items[index] = importAccountActionResult{AccountID: accountID, Action: action}
+	}
+	if len(accountIDs) == 0 {
+		return result
+	}
+	if h.config.OAuthRefresh == nil {
+		for index := range result.Items {
+			result.Items[index].Message = "OAuth credential refresh is not configured."
+		}
+		h.finalizeImportPostAction(parent, result)
+		return result
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), accountImportActionTimeout)
+	defer cancel()
+	type refreshJob struct {
+		index int
+		id    string
+	}
+	jobs := make(chan refreshJob, len(accountIDs))
+	for index, accountID := range accountIDs {
+		jobs <- refreshJob{index: index, id: accountID}
+	}
+	close(jobs)
+	workers := min(accountImportActionMaxConcurrency, len(accountIDs))
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for job := range jobs {
+				var err error
+				if action == "refresh_probe" {
+					_, err = h.config.OAuthRefresh.RefreshAccountForProbeDeferred(ctx, job.id)
+				} else {
+					_, err = h.config.OAuthRefresh.RefreshAccountDeferred(ctx, job.id)
+				}
+				if err != nil {
+					result.Items[job.index].Message = err.Error()
+					continue
+				}
+				result.Items[job.index].Refreshed = true
+				result.Items[job.index].Success = action == "refresh"
+				result.Items[job.index].Message = "OAuth credentials refreshed."
+			}
+		}()
+	}
+	wait.Wait()
+
+	if err := h.reloadAccounts(ctx); err != nil {
+		for index := range result.Items {
+			if result.Items[index].Refreshed {
+				result.Items[index].Success = false
+				result.Items[index].Message = "OAuth credentials refreshed, but the account pool reload failed."
+			}
+		}
+	} else if action == "refresh_probe" && h.config.AccountProbe == nil {
+		for index := range result.Items {
+			if result.Items[index].Refreshed {
+				result.Items[index].Success = false
+				result.Items[index].Message = "OAuth credentials refreshed, but account probing is not configured."
+			}
+		}
+	} else if action == "refresh_probe" {
+		probeIDs := make([]string, 0, len(accountIDs))
+		for _, item := range result.Items {
+			if item.Refreshed {
+				probeIDs = append(probeIDs, item.AccountID)
+			}
+		}
+		probeResults := h.probeImportedAccounts(ctx, probeIDs)
+		probes := make(map[string]accountprobe.Result, len(probeResults))
+		for _, probe := range probeResults {
+			probes[probe.AccountID] = probe
+		}
+		for index := range result.Items {
+			item := &result.Items[index]
+			if !item.Refreshed {
+				continue
+			}
+			probe, ok := probes[item.AccountID]
+			if !ok {
+				item.Message = "OAuth credentials refreshed, but the account probe did not complete."
+				continue
+			}
+			item.Probed = true
+			item.Success = probe.Success
+			item.Message = probe.Message
+			item.Probe = &probe
+			if probe.Account != nil {
+				item.Status = probe.Account.Status
+			}
+		}
+	}
+
+	h.finalizeImportPostAction(parent, result)
+	return result
+}
+
+func (h *Handler) finalizeImportPostAction(parent context.Context, result *importPostActionResult) {
+	if result == nil {
+		return
+	}
+	cleanupContext, cleanupCancel := context.WithTimeout(context.WithoutCancel(parent), accountImportCleanupTimeout)
+	defer cleanupCancel()
+
+	type finalJob struct{ index int }
+	jobs := make(chan finalJob, len(result.Items))
+	for index := range result.Items {
+		jobs <- finalJob{index: index}
+	}
+	close(jobs)
+	workers := min(accountImportActionMaxConcurrency, len(result.Items))
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for job := range jobs {
+				item := &result.Items[job.index]
+				if h.config.Management == nil {
+					continue
+				}
+				account, err := h.config.Management.GetAccount(cleanupContext, item.AccountID)
+				if err != nil {
+					continue
+				}
+				item.Status = account.Status
+				if item.Success || (result.Action != "refresh_probe" && account.Status != domain.AccountError) {
+					continue
+				}
+				message := strings.Join(strings.Fields(strings.TrimSpace(item.Message)), " ")
+				if message == "" {
+					message = "Post-import credential verification did not complete; retry the account probe."
+				}
+				if runes := []rune(message); len(runes) > 500 {
+					message = string(runes[:500])
+				}
+				status := domain.AccountError
+				var cooldownUntil *time.Time
+				updated, updateErr := h.config.Management.UpdateAccount(cleanupContext, item.AccountID, admin.UpdateAccountInput{
+					Status: &status, CooldownUntil: &cooldownUntil, LastError: &message,
+				})
+				if updateErr == nil {
+					item.Status = updated.Status
+					if item.Probe != nil {
+						probeAccount := *updated
+						item.Probe.Account = &probeAccount
+					}
+					if h.config.Accounts != nil {
+						h.config.Accounts.RemoveAccounts([]string{item.AccountID})
+						if clearErr := h.config.Accounts.ClearCooldown(cleanupContext, item.AccountID); clearErr != nil {
+							slog.Warn("clear coordinated cooldown for failed import probe", "account_id", item.AccountID, "error", clearErr)
+						}
+					}
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	if err := h.reloadAccounts(cleanupContext); err != nil {
+		slog.Warn("reload account pool after import action", "error", err)
+	}
+	for _, item := range result.Items {
+		if item.Success {
+			result.Succeeded++
+		}
+	}
+	result.Failed = result.Total - result.Succeeded
+}
+
+func (h *Handler) probeImportedAccounts(ctx context.Context, accountIDs []string) []accountprobe.Result {
+	results := make([]accountprobe.Result, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return results
+	}
+	type probeJob struct {
+		index int
+		id    string
+	}
+	jobs := make(chan probeJob, len(accountIDs))
+	for index, accountID := range accountIDs {
+		jobs <- probeJob{index: index, id: accountID}
+	}
+	close(jobs)
+	workers := min(accountImportActionMaxConcurrency, len(accountIDs))
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for job := range jobs {
+				probe, err := h.config.AccountProbe.Probe(ctx, job.id, accountprobe.Input{})
+				results[job.index] = safeImportProbeResult(job.id, probe, err)
+			}
+		}()
+	}
+	wait.Wait()
+	return results
+}
+
+func safeImportProbeResult(accountID string, probe accountprobe.Result, probeErr error) accountprobe.Result {
+	probe.AccountID = accountID
+	lowerMessage := strings.ToLower(probe.Message)
+	switch {
+	case probe.Success:
+		probe.Message = "Upstream request completed successfully."
+	case probe.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(probe.Message), "protection challenge"):
+		probe.Message = "upstream protection challenge returned HTTP 403; check the account proxy and retry"
+	case errors.Is(probeErr, context.DeadlineExceeded) || strings.Contains(lowerMessage, "timed out") || strings.Contains(lowerMessage, "deadline exceeded"):
+		probe.Message = "Account probe timed out."
+	case errors.Is(probeErr, context.Canceled) || strings.Contains(lowerMessage, "canceled"):
+		probe.Message = "Account probe was canceled."
+	case probe.StatusCode >= http.StatusOK && probe.StatusCode < http.StatusMultipleChoices:
+		probe.Message = "Account probe returned an invalid upstream response."
+	case probe.StatusCode > 0:
+		probe.Message = "Account probe returned HTTP " + strconv.Itoa(probe.StatusCode) + "."
+	default:
+		probe.Message = "Account probe failed."
+	}
+	if probe.CompletedAt.IsZero() {
+		probe.CompletedAt = time.Now().UTC()
+	}
+	if probe.Account != nil {
+		account := *probe.Account
+		if !probe.Success {
+			account.LastError = probe.Message
+		}
+		probe.Account = &account
+	}
+	return probe
 }
 
 func (h *Handler) tokenSummary(w http.ResponseWriter, r *http.Request) {
@@ -1295,6 +1764,23 @@ func (h *Handler) reloadAccounts(ctx context.Context) error {
 	}
 	h.notifyConfiguration(ctx, configevent.ScopeAccounts)
 	return nil
+}
+
+func (h *Handler) syncDeletedAccounts(ctx context.Context, accountIDs []string) {
+	baseContext := context.WithoutCancel(ctx)
+	if h.config.Accounts != nil {
+		h.config.Accounts.RemoveAccounts(accountIDs)
+		reloadContext, cancel := context.WithTimeout(baseContext, accountDeleteSyncTimeout)
+		err := h.config.Accounts.Reload(reloadContext)
+		cancel()
+		if err != nil {
+			slog.Warn("account pool reload after deletion failed", "error", err)
+		}
+	}
+
+	notifyContext, cancel := context.WithTimeout(baseContext, accountDeleteSyncTimeout)
+	defer cancel()
+	h.notifyConfiguration(notifyContext, configevent.ScopeAccounts)
 }
 
 func pagination(r *http.Request) store.Pagination {

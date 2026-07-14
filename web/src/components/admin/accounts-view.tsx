@@ -2,7 +2,7 @@
 
 import { useDeferredValue, useMemo, useRef, useState } from "react";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Activity, CircleAlert, CircleCheck, CircleX, Download, ExternalLink, FileJson, KeyRound, LockKeyhole, Pencil, Plus, Power, PowerOff, RefreshCw, ShieldCheck, Upload, UsersRound, X } from "lucide-react";
+import { Activity, CircleAlert, CircleCheck, CircleX, Download, ExternalLink, FileJson, KeyRound, LockKeyhole, Pencil, Plus, Power, PowerOff, RefreshCw, ShieldCheck, Trash2, Upload, UsersRound, X } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
 import { Button, IconButton } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
@@ -28,8 +28,16 @@ interface OAuthSession {
 
 interface ImportResult {
   imported: number;
+  skipped?: number;
   failed: number;
   errors?: string[];
+  post_action?: {
+    action: "refresh" | "refresh_probe";
+    total: number;
+    succeeded: number;
+    failed: number;
+    items?: Array<{ account_id: string; success: boolean; message?: string }>;
+  };
 }
 
 interface AdminPrincipal {
@@ -40,6 +48,7 @@ interface AdminPrincipal {
 
 type MeResponse = AdminPrincipal | { principal: AdminPrincipal };
 type AccountExportFormat = "native" | "sub2api" | "grok2api" | "cpa";
+interface AccountDeleteSelection { ids: string[]; labels: string[] }
 
 const emptyQuotaSummary: AccountQuotaSummary = {
   total_accounts: 0,
@@ -53,18 +62,29 @@ export function AccountsView() {
   const { toast } = useToast();
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
+  const [kindFilter, setKindFilter] = useState("all");
+  const [tierFilter, setTierFilter] = useState("all");
+  const [proxyFilter, setProxyFilter] = useState("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const deferredSearch = useDeferredValue(search);
-  const accountPath = useMemo(() => paginatedPath("/accounts", page, pageSize, { q: deferredSearch, status: filter === "all" ? "" : filter }), [deferredSearch, filter, page, pageSize]);
+  const accountPath = useMemo(() => paginatedPath("/accounts", page, pageSize, {
+    q: deferredSearch,
+    status: filter === "all" ? "" : filter,
+    kind: kindFilter === "all" ? "" : kindFilter,
+    tier: tierFilter === "all" ? "" : tierFilter,
+    proxy_id: proxyFilter === "all" ? "" : proxyFilter,
+  }), [deferredSearch, filter, kindFilter, page, pageSize, proxyFilter, tierFilter]);
   const resource = useResource<Account[] | ListResponse<Account>>(accountPath, []);
   const quotaResource = useResource<AccountQuotaSummary>("/accounts/quota-summary", emptyQuotaSummary);
   const policyResource = useResource<{ strategy: AccountSchedulingStrategy }>("/accounts/policy", { strategy: "affinity" });
-  const proxyResource = useResource<ProxyRecord[] | ListResponse<ProxyRecord>>("/proxies", []);
+  const proxyResource = useResource<ProxyRecord[] | ListResponse<ProxyRecord>>("/proxies?page=1&page_size=500", []);
   const adminResource = useResource<MeResponse>("/auth/me", { id: "", email: "", totp_enabled: false });
   const [open, setOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [importFiles, setImportFiles] = useState<File[]>([]);
+  const [importSaving, setImportSaving] = useState(false);
+  const [importError, setImportError] = useState("");
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
@@ -72,9 +92,13 @@ export function AccountsView() {
   const [editAccount, setEditAccount] = useState<Account | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [deleteSelection, setDeleteSelection] = useState<AccountDeleteSelection | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const [oauthSession, setOAuthSession] = useState<OAuthSession | null>(null);
   const [oauthLoading, setOAuthLoading] = useState(false);
-  const [refreshingID, setRefreshingID] = useState("");
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [refreshingIDs, setRefreshingIDs] = useState<Set<string>>(() => new Set());
   const [updatingID, setUpdatingID] = useState("");
   const [probingIDs, setProbingIDs] = useState<Set<string>>(() => new Set());
   const [batchProbing, setBatchProbing] = useState(false);
@@ -89,17 +113,24 @@ export function AccountsView() {
   const total = accountList.total ?? accountItems.length;
   usePageClamp(page, pageSize, total, setPage);
   const allVisibleSelected = rows.length > 0 && rows.every((account) => selected.has(account.id));
+  const someVisibleSelected = !allVisibleSelected && rows.some((account) => selected.has(account.id));
   const adminPrincipal = "principal" in adminResource.data ? adminResource.data.principal : adminResource.data;
   const proxyOptions = useMemo(() => [
     { value: "", label: locale === "zh" ? "直连（不使用代理）" : "Direct (no proxy)" },
     ...(normalizeList(proxyResource.data).items ?? []).map((proxy) => ({ value: proxy.id, label: proxy.name })),
   ], [locale, proxyResource.data]);
+  const proxyFilterOptions = useMemo(() => [
+    { value: "all", label: locale === "zh" ? "全部代理" : "All proxies" },
+    { value: "direct", label: locale === "zh" ? "仅直连" : "Direct only" },
+    ...(normalizeList(proxyResource.data).items ?? []).map((proxy) => ({ value: proxy.id, label: proxy.name })),
+  ], [locale, proxyResource.data]);
+  const hasAccountFilters = search.trim() !== "" || filter !== "all" || kindFilter !== "all" || tierFilter !== "all" || proxyFilter !== "all";
 
   const columns: ColumnDef<Account>[] = [
     {
       id: "select",
       enableSorting: false,
-      header: () => <input type="checkbox" aria-label={locale === "zh" ? "选择当前账号" : "Select visible accounts"} checked={allVisibleSelected} onChange={(event) => selectVisible(event.target.checked)} className="size-4 accent-blue-700" />,
+      header: () => <input type="checkbox" aria-label={locale === "zh" ? "选择当前账号" : "Select visible accounts"} aria-checked={someVisibleSelected ? "mixed" : allVisibleSelected} ref={(element) => { if (element) element.indeterminate = someVisibleSelected; }} checked={allVisibleSelected} onChange={(event) => selectVisible(event.target.checked)} className="size-4 accent-blue-700" />,
       cell: ({ row }) => <input type="checkbox" aria-label={locale === "zh" ? `选择 ${row.original.name}` : `Select ${row.original.name}`} checked={selected.has(row.original.id)} onChange={(event) => selectOne(row.original.id, event.target.checked)} className="size-4 accent-blue-700" />,
     },
     { accessorKey: "name", header: locale === "zh" ? "账号" : "Account", cell: ({ row }) => <div className="min-w-0"><div className="truncate font-medium">{row.original.name}</div><div className="truncate text-copy-13 text-fg-subtle">{row.original.email || row.original.id}</div></div> },
@@ -115,9 +146,10 @@ export function AccountsView() {
       header: () => <span className="sr-only">{t("common.actions")}</span>,
       cell: ({ row }) => <div className="flex items-center justify-end gap-0.5">
         <IconButton label={locale === "zh" ? "探测账号连接" : "Probe account connection"} variant="tertiary" loading={probingIDs.has(row.original.id)} onClick={() => void probeAccount(row.original)}><Activity className="size-4" /></IconButton>
-        {row.original.kind === "cli_oauth" ? <IconButton label={locale === "zh" ? "刷新 OAuth 凭据" : "Refresh OAuth credentials"} variant="tertiary" loading={refreshingID === row.original.id} onClick={() => void refreshOAuth(row.original.id)}><RefreshCw className="size-4" /></IconButton> : null}
+        {row.original.kind === "cli_oauth" ? <IconButton label={locale === "zh" ? "刷新 OAuth 凭据" : "Refresh OAuth credentials"} variant="tertiary" loading={refreshingIDs.has(row.original.id)} onClick={() => void refreshOAuth(row.original.id)}><RefreshCw className="size-4" /></IconButton> : null}
         <IconButton label={locale === "zh" ? "编辑账号" : "Edit account"} variant="tertiary" onClick={() => { setFormError(""); setEditAccount(row.original); }}><Pencil className="size-4" /></IconButton>
         <IconButton label={row.original.status === "disabled" ? (locale === "zh" ? "启用账号" : "Enable account") : (locale === "zh" ? "停用账号" : "Disable account")} variant="tertiary" loading={updatingID === row.original.id} onClick={() => void toggleAccount(row.original)}>{row.original.status === "disabled" ? <Power className="size-4" /> : <PowerOff className="size-4" />}</IconButton>
+        <IconButton label={locale === "zh" ? "删除账号" : "Delete account"} variant="tertiary" className="text-danger" onClick={() => openDelete([row.original.id], [row.original.name])}><Trash2 className="size-4" /></IconButton>
       </div>,
     },
   ];
@@ -141,7 +173,57 @@ export function AccountsView() {
   }
 
   async function reloadAccounts() {
-    await Promise.all([resource.reload(), quotaResource.reload()]);
+    const results = await Promise.all([resource.reload(), quotaResource.reload()]);
+    return results.every(Boolean);
+  }
+
+  async function refreshAccounts() {
+    setManualRefreshing(true);
+    try {
+      const refreshed = await reloadAccounts();
+      toast(
+        refreshed ? (locale === "zh" ? "账号池已刷新" : "Account pool refreshed") : (locale === "zh" ? "账号池刷新失败" : "Account pool refresh failed"),
+        refreshed ? "success" : "error",
+      );
+    } finally {
+      setManualRefreshing(false);
+    }
+  }
+
+  function openDelete(ids: string[], labels?: string[]) {
+    setDeleteError("");
+    setDeleteSelection({ ids, labels: labels ?? ids.map((id) => accountItems.find((account) => account.id === id)?.name ?? id) });
+  }
+
+  async function deleteAccounts() {
+    if (!deleteSelection?.ids.length) return;
+    const ids = deleteSelection.ids;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      if (ids.length === 1) {
+        await apiFetch(`/accounts/${encodeURIComponent(ids[0])}`, { method: "DELETE" });
+      } else {
+        await apiFetch("/accounts/batch-delete", { method: "POST", ...jsonBody({ ids }) });
+      }
+      setSelected((current) => {
+        const next = new Set(current);
+        for (const id of ids) next.delete(id);
+        return next;
+      });
+      setDeleteSelection(null);
+      const refreshed = await reloadAccounts();
+      toast(
+        refreshed
+          ? (locale === "zh" ? `已删除 ${ids.length} 个账号` : `Deleted ${ids.length} ${ids.length === 1 ? "account" : "accounts"}`)
+          : (locale === "zh" ? "账号已删除，列表刷新失败" : "Accounts deleted; list refresh failed"),
+        refreshed ? "success" : "error",
+      );
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : t("common.requestFailed"));
+    } finally {
+      setDeleting(false);
+    }
   }
 
   async function probeAccount(account: Account) {
@@ -288,18 +370,40 @@ export function AccountsView() {
   }
 
   async function importAccounts(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setSaving(true); setFormError("");
+    event.preventDefault(); setImportSaving(true); setImportError("");
     const form = new FormData(event.currentTarget);
     form.delete("files");
     for (const file of importFiles) form.append("files", file, file.name);
     try {
       const result = await apiFetch<ImportResult>("/accounts/import", { method: "POST", body: form });
-      setImportOpen(false);
-      setImportFiles([]);
-      toast(locale === "zh" ? `已导入 ${result.imported} 个账号` : `Imported ${result.imported} accounts`);
+      const action = result.post_action;
+      const actionName = action?.action === "refresh"
+        ? (locale === "zh" ? "凭据刷新" : "credential refresh")
+        : (locale === "zh" ? "凭据刷新与探测" : "credential refresh and probe");
+      const message = action && action.total > 0
+        ? (locale === "zh" ? `已导入 ${result.imported} 个账号；${actionName} ${action.succeeded}/${action.total} 成功` : `Imported ${result.imported} accounts; ${actionName} succeeded for ${action.succeeded}/${action.total}`)
+        : (locale === "zh" ? `已导入 ${result.imported} 个账号` : `Imported ${result.imported} accounts`);
+      const skipped = result.skipped ?? 0;
+      const hasFailure = result.failed > 0 || (action?.failed ?? 0) > 0;
+      const countDetails = [
+        skipped > 0 ? (locale === "zh" ? `跳过 ${skipped}` : `Skipped ${skipped}`) : "",
+        result.failed > 0 ? (locale === "zh" ? `导入失败 ${result.failed}` : `Import failed ${result.failed}`) : "",
+      ].filter(Boolean).join(locale === "zh" ? "，" : "; ");
+      const itemErrors = [
+        ...(result.errors ?? []),
+        ...(action?.items ?? []).filter((item) => !item.success && item.message).map((item) => item.message as string),
+      ];
+      const summary = countDetails ? `${message}${locale === "zh" ? "；" : "; "}${countDetails}` : message;
+      if (hasFailure) {
+        setImportError([summary, ...Array.from(new Set(itemErrors)).slice(0, 8)].join("\n"));
+      } else {
+        setImportOpen(false);
+        setImportFiles([]);
+      }
+      toast(summary, hasFailure ? "error" : "success");
       await reloadAccounts();
-    } catch (reason) { setFormError(reason instanceof Error ? reason.message : t("common.requestFailed")); }
-    finally { setSaving(false); }
+    } catch (reason) { setImportError(reason instanceof Error ? reason.message : t("common.requestFailed")); }
+    finally { setImportSaving(false); }
   }
 
   function openExportDialog() {
@@ -345,7 +449,7 @@ export function AccountsView() {
   }
 
   async function refreshOAuth(id: string) {
-    setRefreshingID(id);
+    setRefreshingIDs((current) => new Set(current).add(id));
     try {
       await apiFetch<Account>(`/oauth/refresh/${id}`, { method: "POST", ...jsonBody({}) });
       toast(locale === "zh" ? "OAuth 凭据已刷新" : "OAuth credentials refreshed");
@@ -353,8 +457,13 @@ export function AccountsView() {
     } catch (reason) {
       toast(reason instanceof Error ? reason.message : t("common.requestFailed"), "error");
       await reloadAccounts();
+    } finally {
+      setRefreshingIDs((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
     }
-    finally { setRefreshingID(""); }
   }
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
@@ -372,19 +481,37 @@ export function AccountsView() {
   return (
     <ContentFrame>
       <PageHeader title={t("account.title")} description={t("account.description")} actions={<>
-        <IconButton label={t("common.refresh")} variant="tertiary" onClick={() => void reloadAccounts()} loading={resource.loading || quotaResource.loading}><RefreshCw className="size-4" /></IconButton>
+        <IconButton label={t("common.refresh")} variant="tertiary" onClick={() => void refreshAccounts()} loading={manualRefreshing}><RefreshCw className="size-4" /></IconButton>
         <Button variant="secondary" size="small" onClick={openExportDialog}><Download className="size-3.5" />{locale === "zh" ? "导出账号" : "Export"}</Button>
-        <Button variant="secondary" size="small" onClick={() => { setFormError(""); setImportFiles([]); setImportOpen(true); }}><Upload className="size-3.5" />{locale === "zh" ? "批量导入" : "Import"}</Button>
+        <Button variant="secondary" size="small" onClick={() => { setImportError(""); setImportFiles([]); setImportOpen(true); }}><Upload className="size-3.5" />{locale === "zh" ? "批量导入" : "Import"}</Button>
         <Button variant="secondary" size="small" onClick={() => { setFormError(""); setOAuthOpen(true); }}><KeyRound className="size-3.5" />OAuth</Button>
         <Button size="small" onClick={() => { setFormError(""); setOpen(true); }}><Plus className="size-3.5" />{locale === "zh" ? "添加账号" : "Add Account"}</Button>
       </>} />
       <QuotaSummaryBand summary={quotaResource.data} locale={locale} />
-      <Toolbar search={search} onSearch={(value) => { setSearch(value); setPage(1); }} placeholder={locale === "zh" ? "搜索名称、邮箱或标签" : "Search name, email, or tag"} filter={filter} onFilter={(value) => { setFilter(value); setPage(1); }} filterOptions={[{ value: "all", label: locale === "zh" ? "全部状态" : "All statuses" }, { value: "active", label: "Active" }, { value: "cooldown", label: "Cooldown" }, { value: "expired", label: "Expired" }, { value: "disabled", label: "Disabled" }, { value: "error", label: "Error" }]} filters={<div className="w-full sm:w-44"><Select aria-label={locale === "zh" ? "账号调度策略" : "Account scheduling strategy"} value={policyResource.data.strategy} disabled={savingPolicy} onChange={(event) => void updatePolicy(event.target.value as AccountSchedulingStrategy)} options={[{ value: "affinity", label: locale === "zh" ? "策略：会话亲和" : "Strategy: Affinity" }, { value: "priority", label: locale === "zh" ? "策略：优先级" : "Strategy: Priority" }, { value: "round_robin", label: locale === "zh" ? "策略：轮询" : "Strategy: Round robin" }]} /></div>} trailing={<><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} loading={batchProbing} onClick={() => void probeSelected()}><Activity className="size-3.5" />{locale === "zh" ? `批量探测 (${selected.size})` : `Probe selected (${selected.size})`}</Button><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} onClick={() => { setFormError(""); setBatchOpen(true); }}><UsersRound className="size-3.5" />{locale === "zh" ? `批量编辑 (${selected.size})` : `Edit selected (${selected.size})`}</Button></>} />
+      <Toolbar
+        search={search}
+        onSearch={(value) => { setSearch(value); setPage(1); }}
+        placeholder={locale === "zh" ? "搜索名称、邮箱或标签" : "Search name, email, or tag"}
+        filters={<>
+          <div className="w-full sm:w-36"><Select aria-label={locale === "zh" ? "按账号状态筛选" : "Filter by account status"} value={filter} onChange={(event) => { setFilter(event.target.value); setPage(1); }} options={[{ value: "all", label: locale === "zh" ? "全部状态" : "All statuses" }, { value: "active", label: locale === "zh" ? "已启用" : "Active" }, { value: "cooldown", label: locale === "zh" ? "冷却中" : "Cooldown" }, { value: "expired", label: locale === "zh" ? "已过期" : "Expired" }, { value: "disabled", label: locale === "zh" ? "已停用" : "Disabled" }, { value: "error", label: locale === "zh" ? "异常" : "Error" }]} /></div>
+          <div className="w-full sm:w-40"><Select aria-label={locale === "zh" ? "按凭据类型筛选" : "Filter by credential type"} value={kindFilter} onChange={(event) => { setKindFilter(event.target.value); setPage(1); }} options={[{ value: "all", label: locale === "zh" ? "全部凭据" : "All credentials" }, { value: "cli_oauth", label: "CLI OAuth" }, { value: "console_sso", label: "Console SSO" }, { value: "grok_sso", label: "Grok SSO" }]} /></div>
+          <div className="w-full sm:w-36"><Select aria-label={locale === "zh" ? "按账号等级筛选" : "Filter by account tier"} value={tierFilter} onChange={(event) => { setTierFilter(event.target.value); setPage(1); }} options={[{ value: "all", label: locale === "zh" ? "全部等级" : "All tiers" }, { value: "basic", label: "Basic" }, { value: "super", label: "Super" }, { value: "heavy", label: "Heavy" }]} /></div>
+          <div className="w-full sm:w-44"><Select aria-label={locale === "zh" ? "按绑定代理筛选" : "Filter by bound proxy"} value={proxyFilter} onChange={(event) => { setProxyFilter(event.target.value); setPage(1); }} options={proxyFilterOptions} /></div>
+          <div className="w-full sm:w-44"><Select aria-label={locale === "zh" ? "账号调度策略" : "Account scheduling strategy"} value={policyResource.data.strategy} disabled={savingPolicy} onChange={(event) => void updatePolicy(event.target.value as AccountSchedulingStrategy)} options={[{ value: "affinity", label: locale === "zh" ? "策略：会话亲和" : "Strategy: Affinity" }, { value: "priority", label: locale === "zh" ? "策略：优先级" : "Strategy: Priority" }, { value: "round_robin", label: locale === "zh" ? "策略：轮询" : "Strategy: Round robin" }]} /></div>
+          {hasAccountFilters ? <Button className="w-full sm:w-auto" type="button" size="small" variant="tertiary" onClick={() => { setSearch(""); setFilter("all"); setKindFilter("all"); setTierFilter("all"); setProxyFilter("all"); setPage(1); }}><X className="size-3.5" />{locale === "zh" ? "重置筛选" : "Reset filters"}</Button> : null}
+        </>}
+        trailing={<><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} loading={batchProbing} onClick={() => void probeSelected()}><Activity className="size-3.5" />{locale === "zh" ? `批量探测 (${selected.size})` : `Probe selected (${selected.size})`}</Button><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} onClick={() => { setFormError(""); setBatchOpen(true); }}><UsersRound className="size-3.5" />{locale === "zh" ? `批量编辑 (${selected.size})` : `Edit selected (${selected.size})`}</Button><Button className="w-full text-danger sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} onClick={() => openDelete([...selected])}><Trash2 className="size-3.5" />{locale === "zh" ? `删除所选 (${selected.size})` : `Delete selected (${selected.size})`}</Button></>}
+      />
       {resource.loading && !accountItems.length ? <LoadingState label={t("common.loading")} /> : resource.error ? <ErrorState title={t("common.requestFailed")} description={resource.error.message} onRetry={() => void reloadAccounts()} /> : rows.length ? <DataTable ariaLabel={t("account.title")} data={rows} columns={columns} getRowId={(row) => row.id} /> : <EmptyState title={locale === "zh" ? "没有匹配的账号" : "No matching accounts"} description={locale === "zh" ? "添加上游凭据，或调整当前筛选条件。" : "Add an upstream credential or adjust the current filters."} action={<Button size="small" onClick={() => setOpen(true)}><Plus className="size-3.5" />{locale === "zh" ? "添加账号" : "Add Account"}</Button>} />}
       <PageFooter count={rows.length} noun={locale === "zh" ? "个账号" : "accounts"} total={total} page={page} pageSize={pageSize} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} locale={locale} />
 
       <Dialog open={Boolean(editAccount)} onOpenChange={(next) => { if (!next) setEditAccount(null); }}><DialogContent title={locale === "zh" ? "编辑账号" : "Edit Account"} description={editAccount?.email || editAccount?.id}>
         {editAccount ? <form onSubmit={editAccountSubmit}><div className="grid gap-4 px-5 py-5"><Input name="name" defaultValue={editAccount.name} label={t("common.name")} required /><div className="grid gap-4 sm:grid-cols-2"><Input name="tier" defaultValue={editAccount.tier} label={locale === "zh" ? "账号等级" : "Tier"} /><Select name="status" defaultValue={editAccount.status} label={t("common.status")} options={[{ value: "active", label: locale === "zh" ? "已启用" : "Active" }, { value: "disabled", label: locale === "zh" ? "已停用" : "Disabled" }]} /></div><div className="grid gap-4 sm:grid-cols-2"><Input name="priority" type="number" defaultValue={editAccount.priority} label={locale === "zh" ? "优先级" : "Priority"} required /><Input name="concurrency_limit" type="number" min="1" defaultValue={editAccount.concurrency_limit} label={locale === "zh" ? "并发限制" : "Concurrency Limit"} required /></div>{formError ? <p role="alert" className="text-copy-13 text-danger">{formError}</p> : null}</div><FormActions><DialogClose asChild><Button type="button" variant="secondary">{t("common.cancel")}</Button></DialogClose><Button type="submit" loading={saving}>{t("common.save")}</Button></FormActions></form> : null}
+      </DialogContent></Dialog>
+
+      <Dialog open={Boolean(deleteSelection)} onOpenChange={(next) => { if (!next && !deleting) { setDeleteSelection(null); setDeleteError(""); } }}><DialogContent title={deleteSelection?.ids.length === 1 ? (locale === "zh" ? "删除账号" : "Delete Account") : (locale === "zh" ? `删除 ${deleteSelection?.ids.length ?? 0} 个账号` : `Delete ${deleteSelection?.ids.length ?? 0} Accounts`)} description={locale === "zh" ? "此操作会永久移除所选凭据和调度状态。" : "This permanently removes the selected credentials and scheduling state."}>
+        <div className="grid gap-3 px-5 py-5"><p className="text-copy-14 text-fg-muted">{locale === "zh" ? "删除后，请求将不再调度到这些账号。此操作不可撤销。" : "Requests will no longer be scheduled to these accounts. This action is permanent."}</p><div className="max-h-32 overflow-y-auto rounded-[6px] border border-border bg-subtle px-3 py-2 font-mono text-copy-13 text-fg">{deleteSelection?.labels.map((label, index) => <div key={deleteSelection.ids[index] ?? `${label}-${index}`} className="truncate">{label}</div>)}</div>{deleteError ? <p role="alert" className="text-copy-13 text-danger">{deleteError}</p> : null}</div>
+        <FormActions><Button type="button" variant="secondary" disabled={deleting} onClick={() => { setDeleteSelection(null); setDeleteError(""); }}>{t("common.cancel")}</Button><Button type="button" variant="danger" loading={deleting} onClick={() => void deleteAccounts()}><Trash2 className="size-4" />{t("common.delete")}</Button></FormActions>
       </DialogContent></Dialog>
 
       <Dialog open={batchOpen} onOpenChange={setBatchOpen}><DialogContent title={locale === "zh" ? `批量编辑 ${selected.size} 个账号` : `Edit ${selected.size} accounts`} description={locale === "zh" ? "仅勾选的字段会应用到所选账号。" : "Only checked fields are applied to selected accounts."} className="max-w-xl">
@@ -402,9 +529,40 @@ export function AccountsView() {
         <form onSubmit={submit}><div className="grid gap-4 px-5 py-5"><Input name="name" label={t("common.name")} placeholder="Production account" required /><div className="grid gap-4 sm:grid-cols-2"><Select name="kind" label={locale === "zh" ? "凭据类型" : "Credential Type"} options={[{ value: "cli_oauth", label: "CLI OAuth" }, { value: "console_sso", label: "Console SSO" }, { value: "grok_sso", label: "Grok SSO" }]} /><Input name="email" type="email" label={locale === "zh" ? "邮箱" : "Email"} placeholder="name@example.com" /></div><Textarea name="access_token" label="Access Token" placeholder="Token" rows={3} /><div className="grid gap-4 sm:grid-cols-2"><Input name="sso" type="password" label="SSO" autoComplete="off" /><Input name="sso_rw" type="password" label="SSO-RW" autoComplete="off" /></div><div className="grid gap-4 sm:grid-cols-2"><Input name="priority" type="number" defaultValue="100" label={locale === "zh" ? "优先级" : "Priority"} /><Input name="concurrency_limit" type="number" min="1" defaultValue="4" label={locale === "zh" ? "并发限制" : "Concurrency Limit"} /></div><Input name="tags" label={locale === "zh" ? "标签" : "Tags"} description={locale === "zh" ? "使用英文逗号分隔。" : "Separate tags with commas."} placeholder="production, primary" />{formError ? <p role="alert" className="text-copy-13 text-danger">{formError}</p> : null}</div><FormActions><DialogClose asChild><Button type="button" variant="secondary">{t("common.cancel")}</Button></DialogClose><Button type="submit" loading={saving}>{locale === "zh" ? "添加账号" : "Add Account"}</Button></FormActions></form>
       </DialogContent></Dialog>
 
-      <Dialog open={importOpen} onOpenChange={(next) => { setImportOpen(next); if (!next) setImportFiles([]); }}><DialogContent title={locale === "zh" ? "批量导入账号" : "Import Accounts"} description={locale === "zh" ? "支持 TXT、JSON、xAI Build OAuth 以及 grok2api 账号池格式。" : "Accepts TXT, JSON, xAI Build OAuth, and grok2api pool exports."}>
-        <form onSubmit={importAccounts}><div className="grid gap-4 px-5 py-5"><ImportFilePicker files={importFiles} locale={locale} onChange={setImportFiles} /><Textarea name="tokens" label={locale === "zh" ? "凭据文本" : "Credential Text"} description={locale === "zh" ? "每行一个凭据；文件和文本可同时提交。" : "One credential per line; file and text can be submitted together."} rows={5} /><div className="grid gap-4 sm:grid-cols-2"><Select name="kind" defaultValue="grok_sso" label={locale === "zh" ? "凭据类型" : "Credential Type"} options={[{ value: "grok_sso", label: "Grok SSO" }, { value: "console_sso", label: "Console SSO" }, { value: "cli_oauth", label: "CLI OAuth Token" }]} /><Select name="tier" defaultValue="basic" label={locale === "zh" ? "账号等级" : "Tier"} options={[{ value: "basic", label: "Basic" }, { value: "super", label: "Super" }, { value: "heavy", label: "Heavy" }]} /></div><Input name="tags" label={locale === "zh" ? "标签" : "Tags"} placeholder="imported, production" />{formError ? <p role="alert" className="text-copy-13 text-danger">{formError}</p> : null}</div><FormActions><DialogClose asChild><Button type="button" variant="secondary">{t("common.cancel")}</Button></DialogClose><Button type="submit" loading={saving}><Upload className="size-3.5" />{locale === "zh" ? "开始导入" : "Import"}</Button></FormActions></form>
-      </DialogContent></Dialog>
+      <Dialog open={importOpen} onOpenChange={(next) => {
+        if (!next && importSaving) return;
+        setImportOpen(next);
+        if (!next) { setImportFiles([]); setImportError(""); }
+      }}>
+        <DialogContent
+          title={locale === "zh" ? "批量导入账号" : "Import Accounts"}
+          description={locale === "zh" ? "支持 TXT、JSON、xAI Build OAuth 以及 grok2api 账号池格式。" : "Accepts TXT, JSON, xAI Build OAuth, and grok2api pool exports."}
+          closeDisabled={importSaving}
+        >
+          <form onSubmit={importAccounts}>
+            <fieldset disabled={importSaving} className="contents">
+              <div className="grid gap-4 px-5 py-5">
+                <ImportFilePicker files={importFiles} locale={locale} onChange={setImportFiles} />
+                <Textarea name="tokens" label={locale === "zh" ? "凭据文本" : "Credential Text"} description={locale === "zh" ? "每行一个凭据；文件和文本可同时提交。" : "One credential per line; file and text can be submitted together."} rows={5} />
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Select name="kind" defaultValue="grok_sso" label={locale === "zh" ? "凭据类型" : "Credential Type"} options={[{ value: "grok_sso", label: "Grok SSO" }, { value: "console_sso", label: "Console SSO" }, { value: "cli_oauth", label: "CLI OAuth Token" }]} />
+                  <Select name="tier" defaultValue="basic" label={locale === "zh" ? "账号等级" : "Tier"} options={[{ value: "basic", label: "Basic" }, { value: "super", label: "Super" }, { value: "heavy", label: "Heavy" }]} />
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Select name="initial_status" defaultValue="active" label={locale === "zh" ? "导入后状态" : "Initial Status"} options={[{ value: "active", label: locale === "zh" ? "启用" : "Active" }, { value: "", label: locale === "zh" ? "保留文件状态" : "Preserve file status" }, { value: "disabled", label: locale === "zh" ? "停用" : "Disabled" }]} />
+                  <Select name="post_import_action" defaultValue="refresh_probe" label={locale === "zh" ? "导入后操作" : "Post-import Action"} options={[{ value: "refresh_probe", label: locale === "zh" ? "刷新凭据并探测" : "Refresh and probe" }, { value: "refresh", label: locale === "zh" ? "仅刷新凭据" : "Refresh only" }, { value: "none", label: locale === "zh" ? "不执行" : "None" }]} />
+                </div>
+                <Input name="tags" label={locale === "zh" ? "标签" : "Tags"} placeholder="imported, production" />
+                {importError ? <p role="alert" className="whitespace-pre-line text-copy-13 text-danger">{importError}</p> : null}
+              </div>
+              <FormActions>
+                <DialogClose asChild><Button type="button" variant="secondary" disabled={importSaving}>{t("common.cancel")}</Button></DialogClose>
+                <Button type="submit" loading={importSaving}><Upload className="size-3.5" />{locale === "zh" ? "开始导入" : "Import"}</Button>
+              </FormActions>
+            </fieldset>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={exportOpen} onOpenChange={(next) => { setExportOpen(next); if (!next) setExportError(""); }}><DialogContent title={locale === "zh" ? "导出账号" : "Export Accounts"} description={locale === "zh" ? `导出已选择的 ${selected.size} 个账号。` : `Export ${selected.size} selected accounts.`}>
         <form onSubmit={exportAccounts}>

@@ -15,14 +15,18 @@ import (
 )
 
 type recordingConfigNotifier struct {
-	mu     sync.Mutex
-	scopes []configevent.Scope
+	mu              sync.Mutex
+	scopes          []configevent.Scope
+	lastContextErr  error
+	lastHasDeadline bool
 }
 
-func (n *recordingConfigNotifier) Notify(_ context.Context, scope configevent.Scope) error {
+func (n *recordingConfigNotifier) Notify(ctx context.Context, scope configevent.Scope) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.scopes = append(n.scopes, scope)
+	n.lastContextErr = ctx.Err()
+	_, n.lastHasDeadline = ctx.Deadline()
 	return nil
 }
 

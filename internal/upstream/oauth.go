@@ -255,6 +255,28 @@ type RefreshService struct {
 // RefreshAccount refreshes one account while serializing refresh-token rotation
 // across manual requests, background workers, and service instances.
 func (s *RefreshService) RefreshAccount(ctx context.Context, accountID string) (domain.Credentials, error) {
+	return s.refreshAccountWithStatus(ctx, accountID, domain.AccountActive, true)
+}
+
+// RefreshAccountForProbe refreshes one account while keeping it out of normal
+// scheduling until a subsequent health probe records the account as active.
+func (s *RefreshService) RefreshAccountForProbe(ctx context.Context, accountID string) (domain.Credentials, error) {
+	return s.refreshAccountWithStatus(ctx, accountID, domain.AccountError, true)
+}
+
+// RefreshAccountDeferred refreshes credentials without invoking the change
+// callback. Batch callers must reload and publish once after all items finish.
+func (s *RefreshService) RefreshAccountDeferred(ctx context.Context, accountID string) (domain.Credentials, error) {
+	return s.refreshAccountWithStatus(ctx, accountID, domain.AccountActive, false)
+}
+
+// RefreshAccountForProbeDeferred is the held-state batch variant of
+// RefreshAccountForProbe.
+func (s *RefreshService) RefreshAccountForProbeDeferred(ctx context.Context, accountID string) (domain.Credentials, error) {
+	return s.refreshAccountWithStatus(ctx, accountID, domain.AccountError, false)
+}
+
+func (s *RefreshService) refreshAccountWithStatus(ctx context.Context, accountID string, successStatus domain.AccountStatus, notify bool) (domain.Credentials, error) {
 	if s.OAuth == nil || s.Store == nil {
 		return domain.Credentials{}, errors.New("OAuth refresh service is incomplete")
 	}
@@ -266,8 +288,8 @@ func (s *RefreshService) RefreshAccount(ctx context.Context, accountID string) (
 	if err != nil {
 		return domain.Credentials{}, err
 	}
-	result, changed, err := s.refreshAccount(ctx, accountID, credentials, time.Time{})
-	if changed {
+	result, changed, err := s.refreshAccount(ctx, accountID, credentials, time.Time{}, successStatus)
+	if changed && notify {
 		s.accountsChanged(ctx)
 	}
 	return result, err
@@ -315,7 +337,7 @@ func (s *RefreshService) RefreshDue(ctx context.Context) error {
 	var failures []error
 	changed := false
 	for _, account := range items {
-		if account.Kind != domain.CredentialCLIOAuth || account.Status == domain.AccountDisabled || account.CooldownUntil != nil && account.CooldownUntil.After(now) {
+		if account.Kind != domain.CredentialCLIOAuth || account.Status == domain.AccountDisabled || account.Status == domain.AccountError || account.CooldownUntil != nil && account.CooldownUntil.After(now) {
 			continue
 		}
 		credentials, loadErr := s.Store.Credentials(ctx, account.ID)
@@ -348,7 +370,7 @@ func (s *RefreshService) RefreshDue(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			}
-			_, accountChanged, refreshErr := s.refreshAccount(ctx, accountID, current, refreshBefore)
+			_, accountChanged, refreshErr := s.refreshAccount(ctx, accountID, current, refreshBefore, domain.AccountActive)
 			if accountChanged {
 				mu.Lock()
 				changed = true
@@ -368,7 +390,7 @@ func (s *RefreshService) RefreshDue(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-func (s *RefreshService) refreshAccount(ctx context.Context, accountID string, initial domain.Credentials, refreshBefore time.Time) (result domain.Credentials, changed bool, err error) {
+func (s *RefreshService) refreshAccount(ctx context.Context, accountID string, initial domain.Credentials, refreshBefore time.Time, successStatus domain.AccountStatus) (result domain.Credentials, changed bool, err error) {
 	current := initial
 	if s.Locks != nil {
 		owner := []byte(randomToken(24))
@@ -405,6 +427,12 @@ func (s *RefreshService) refreshAccount(ctx context.Context, accountID string, i
 			return domain.Credentials{}, false, fmt.Errorf("reload credentials after locking: %w", loadErr)
 		}
 		if !sameOAuthCredentials(initial, latest) {
+			if successStatus != domain.AccountActive {
+				if saveErr := s.Store.SaveOAuthRefresh(ctx, accountID, OAuthRefreshUpdate{Status: successStatus}); saveErr != nil {
+					return domain.Credentials{}, false, fmt.Errorf("preserve post-refresh account status: %w", saveErr)
+				}
+				return latest, true, nil
+			}
 			return latest, false, nil
 		}
 		current = latest
@@ -413,25 +441,30 @@ func (s *RefreshService) refreshAccount(ctx context.Context, accountID string, i
 		return current, false, nil
 	}
 	if current.RefreshToken == "" {
-		changed, failureErr := s.recordRefreshFailure(ctx, accountID, current, errors.New("OAuth refresh token is empty"))
+		changed, failureErr := s.recordRefreshFailure(ctx, accountID, current, errors.New("OAuth refresh token is empty"), successStatus)
 		return domain.Credentials{}, changed, failureErr
 	}
 	updated, err := s.OAuth.Refresh(ctx, current)
 	if err != nil {
-		changed, failureErr := s.recordRefreshFailure(ctx, accountID, current, err)
+		changed, failureErr := s.recordRefreshFailure(ctx, accountID, current, err, successStatus)
 		return domain.Credentials{}, changed, failureErr
 	}
-	if err := s.Store.SaveOAuthRefresh(ctx, accountID, OAuthRefreshUpdate{Credentials: &updated, Status: domain.AccountActive}); err != nil {
+	if err := s.Store.SaveOAuthRefresh(ctx, accountID, OAuthRefreshUpdate{Credentials: &updated, Status: successStatus}); err != nil {
 		return domain.Credentials{}, false, err
 	}
 	return updated, true, nil
 }
 
-func (s *RefreshService) recordRefreshFailure(ctx context.Context, accountID string, credentials domain.Credentials, cause error) (bool, error) {
+func (s *RefreshService) recordRefreshFailure(ctx context.Context, accountID string, credentials domain.Credentials, cause error, successStatus domain.AccountStatus) (bool, error) {
 	now := s.currentTime()
 	summary := oauthRefreshFailureSummary(cause)
 	update := OAuthRefreshUpdate{Status: domain.AccountCooldown, LastError: summary}
-	if !credentials.ExpiresAt.IsZero() && !credentials.ExpiresAt.After(now) {
+	if successStatus == domain.AccountError {
+		// A refresh-and-probe caller deliberately held this account outside the
+		// scheduler. A failed refresh must not turn that hold into a cooldown
+		// which later promotes itself to active without a successful probe.
+		update.Status = domain.AccountError
+	} else if !credentials.ExpiresAt.IsZero() && !credentials.ExpiresAt.After(now) {
 		update.Status = domain.AccountExpired
 	} else {
 		cooldown := s.FailureCooldown

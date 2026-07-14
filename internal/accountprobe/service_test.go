@@ -3,8 +3,10 @@ package accountprobe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +71,82 @@ func TestProbeTurnsCredentialRejectionIntoDisabledAccount(t *testing.T) {
 	}
 }
 
+func TestProbeTreatsCloudflareChallengeAsTransientAndRedactsHTML(t *testing.T) {
+	account := domain.Account{ID: "challenged", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
+	memory := accounts.NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "valid-token"}})
+	pool := accounts.NewPool(memory, accounts.DefaultPolicy())
+	challenge := `<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><script src="https://challenges.cloudflare.com/turnstile/v0/api.js">credential-shaped-secret</script></body></html>`
+	client := upstream.ClientFunc(func(context.Context, upstream.Request) (*upstream.Response, error) {
+		return &upstream.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     http.Header{"Content-Type": {"text/html; charset=UTF-8"}, "Server": {"cloudflare"}},
+			Body:       json.RawMessage(challenge),
+		}, nil
+	})
+	service, err := New(Config{Accounts: pool, Reader: memory, Upstream: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Probe(context.Background(), account.ID, Input{})
+	if err != nil || result.Success || result.Account == nil {
+		t.Fatalf("result = %+v, err = %v", result, err)
+	}
+	if result.StatusCode != http.StatusForbidden || result.Account.Status != domain.AccountCooldown || result.Account.CooldownUntil == nil {
+		t.Fatalf("challenge state = %+v", result)
+	}
+	if result.Account.Status == domain.AccountDisabled {
+		t.Fatalf("challenge permanently disabled account: %+v", result.Account)
+	}
+	for _, value := range []string{result.Message, result.Account.LastError} {
+		lower := strings.ToLower(value)
+		if strings.Contains(lower, "<!doctype") || strings.Contains(lower, "<html") || strings.Contains(lower, "credential-shaped-secret") {
+			t.Fatalf("HTML challenge leaked into persisted/displayed error: %q", value)
+		}
+	}
+	if result.Message != "upstream protection challenge returned HTTP 403; check the account proxy and retry" {
+		t.Fatalf("challenge message = %q", result.Message)
+	}
+}
+
+func TestUpstreamResponseErrorRedactsGenericHTML(t *testing.T) {
+	response := &upstream.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": {"text/html"}},
+		Body:       json.RawMessage(`<!doctype html><html><body>internal-edge-secret</body></html>`),
+	}
+	message := upstreamResponseError(response).Error()
+	if message != "upstream returned HTTP 502: Bad Gateway" {
+		t.Fatalf("sanitized message = %q", message)
+	}
+}
+
+func TestUpstreamResponseErrorRedactsJSONDetail(t *testing.T) {
+	response := &upstream.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       json.RawMessage(`{"error":{"message":"echoed-access-token-secret"}}`),
+	}
+	message := upstreamResponseError(response).Error()
+	if message != "upstream returned HTTP 401: Unauthorized" || strings.Contains(message, "echoed-access-token-secret") {
+		t.Fatalf("sanitized message = %q", message)
+	}
+}
+
+func TestUpstreamResponseErrorRecognizesCFMitigatedChallenge(t *testing.T) {
+	header := http.Header{"Content-Type": {"text/html"}}
+	header.Set("CF-Mitigated", "challenge")
+	response := &upstream.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     header,
+		Body:       json.RawMessage(`<!doctype html><html><body>edge verification</body></html>`),
+	}
+	var challenge *upstreamProtectionChallengeError
+	if err := upstreamResponseError(response); !errors.As(err, &challenge) {
+		t.Fatalf("error = %v, want protection challenge classification", err)
+	}
+}
+
 func TestProbeUsesCurrentCLIModel(t *testing.T) {
 	account := domain.Account{ID: "cli", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
 	memory := accounts.NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "token"}})
@@ -127,6 +205,23 @@ func TestProbeDoesNotTreatEmptyTwoHundredResponseAsSuccess(t *testing.T) {
 	}
 	if result.Message != "upstream returned no parseable response events" {
 		t.Fatalf("empty response message = %q", result.Message)
+	}
+}
+
+func TestProbeRedactsUpstreamErrorEvent(t *testing.T) {
+	account := domain.Account{ID: "error-event", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
+	memory := accounts.NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "token"}})
+	pool := accounts.NewPool(memory, accounts.DefaultPolicy())
+	client := upstream.ClientFunc(func(context.Context, upstream.Request) (*upstream.Response, error) {
+		return &upstream.Response{StatusCode: http.StatusOK, Events: upstream.Events(upstream.Event{Kind: upstream.EventError, Error: "echoed-sensitive-value"})}, nil
+	})
+	service, err := New(Config{Accounts: pool, Reader: memory, Upstream: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Probe(context.Background(), account.ID, Input{})
+	if err != nil || result.Success || result.Message != "upstream returned an error event" || strings.Contains(result.Message, "echoed-sensitive-value") {
+		t.Fatalf("error event result = %+v, err = %v", result, err)
 	}
 }
 

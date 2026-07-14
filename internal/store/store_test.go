@@ -80,10 +80,15 @@ func TestCacheRequestRatesClampInvalidCounts(t *testing.T) {
 	if got := CacheUsageCoverage(4, 5); got != 80 {
 		t.Fatalf("usage coverage = %v", got)
 	}
+	if got := CacheAffinityMissRate(1, 2); got != 50 {
+		t.Fatalf("affinity miss rate = %v", got)
+	}
 	for _, value := range []float64{
 		CacheRequestHitRate(1, 0),
 		CacheRequestHitRate(-1, 10),
 		CacheUsageCoverage(20, 10),
+		CacheAffinityMissRate(1, 0),
+		CacheAffinityMissRate(20, 10),
 	} {
 		if value < 0 || value > 100 {
 			t.Fatalf("percentage escaped valid range: %v", value)

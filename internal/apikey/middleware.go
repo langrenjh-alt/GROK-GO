@@ -46,11 +46,14 @@ type Middleware struct {
 // request was being served. UsageParsed distinguishes a real zero-token usage
 // report from a response that did not include usage at all.
 type Completion struct {
-	AccountID    string
-	InputTokens  int64
-	OutputTokens int64
-	CachedTokens int64
-	UsageParsed  bool
+	AccountID                string
+	InputTokens              int64
+	OutputTokens             int64
+	CachedTokens             int64
+	UsageParsed              bool
+	CacheIdentityApplied     bool
+	CacheAffinityReused      bool
+	CacheAffinityEstablished bool
 }
 
 type completionTracker struct {
@@ -64,11 +67,19 @@ func (t *completionTracker) record(value Completion) {
 	if value.AccountID != "" {
 		t.completion.AccountID = value.AccountID
 	}
+	if value.CacheIdentityApplied {
+		t.completion.CacheIdentityApplied = true
+		t.completion.CacheAffinityReused = value.CacheAffinityReused
+		t.completion.CacheAffinityEstablished = value.CacheAffinityEstablished
+	}
 	if value.UsageParsed {
 		value.InputTokens = max(0, value.InputTokens)
 		value.OutputTokens = max(0, value.OutputTokens)
 		value.CachedTokens = max(0, value.CachedTokens)
 		value.AccountID = t.completion.AccountID
+		value.CacheIdentityApplied = t.completion.CacheIdentityApplied
+		value.CacheAffinityReused = t.completion.CacheAffinityReused
+		value.CacheAffinityEstablished = t.completion.CacheAffinityEstablished
 		t.completion = value
 	}
 }

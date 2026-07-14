@@ -2,6 +2,7 @@ package requestlog
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,6 +53,7 @@ func TestMiddlewareRecordsCompletionUsage(t *testing.T) {
 	inner := Middleware{Sink: sink}.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apikey.ReportCompletion(r.Context(), apikey.Completion{
 			AccountID: "account-1", InputTokens: 9, OutputTokens: 4, CachedTokens: 3, UsageParsed: true,
+			CacheIdentityApplied: true, CacheAffinityReused: true, CacheAffinityEstablished: true,
 		})
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -70,6 +72,10 @@ func TestMiddlewareRecordsCompletionUsage(t *testing.T) {
 	}
 	if sink.entry.InputTokens != 9 || sink.entry.OutputTokens != 4 || sink.entry.CachedTokens != 3 || !sink.entry.UsageParsed {
 		t.Fatalf("unexpected log usage: %+v", sink.entry)
+	}
+	var metadata map[string]bool
+	if err := json.Unmarshal(sink.entry.Metadata, &metadata); err != nil || !metadata["cache_identity_applied"] || !metadata["cache_affinity_reused"] || !metadata["cache_affinity_established"] {
+		t.Fatalf("unexpected cache metadata: %s, %v", sink.entry.Metadata, err)
 	}
 }
 

@@ -1187,13 +1187,14 @@ func TestDashboardCacheMetricsUseSuccessfulConversationalUsageOnly(t *testing.T)
 	environment := newAuthenticatedEnvironment(t)
 	now := time.Now().UTC()
 	logs := []domain.RequestLog{
-		{RequestID: "cache-partial", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-partial", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, UsageParsed: true, Metadata: json.RawMessage(`{"cache_identity_applied":true,"cache_affinity_reused":true}`), CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "cache-rate-limited", Endpoint: "/v1/responses", StatusCode: http.StatusTooManyRequests, DurationMS: 300, InputTokens: 300, OutputTokens: 30, CachedTokens: 180, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "missing-usage", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 500, CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "parsed-zero-usage", Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 80, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "cache-over-report", Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, CachedTokens: 250, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "non-cache-media", Endpoint: "/v1/images/generations", StatusCode: http.StatusOK, DurationMS: 200, InputTokens: 400, CachedTokens: 300, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "cache-miss", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 120, InputTokens: 200, OutputTokens: 10, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-miss", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 120, InputTokens: 200, OutputTokens: 10, UsageParsed: true, Metadata: json.RawMessage(`{"cache_identity_applied":true,"cache_affinity_reused":true}`), CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-warmup", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 50, InputTokens: 50, OutputTokens: 5, UsageParsed: true, Metadata: json.RawMessage(`{"cache_identity_applied":true,"cache_affinity_reused":false,"cache_affinity_established":true}`), CreatedAt: now.Add(-30 * time.Minute)},
 		{RequestID: "outside-window", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 10, InputTokens: 100, OutputTokens: 10, CachedTokens: 100, UsageParsed: true, CreatedAt: now.Add(-25 * time.Hour)},
 	}
 	for index := range logs {
@@ -1217,11 +1218,15 @@ func TestDashboardCacheMetricsUseSuccessfulConversationalUsageOnly(t *testing.T)
 			UsageSamples                int64     `json:"usage_samples_24h"`
 			CacheSamples                int64     `json:"cache_samples_24h"`
 			CacheRequestHits            int64     `json:"cache_request_hits_24h"`
+			CacheWarmupCandidates       int64     `json:"cache_warmup_candidates_24h"`
+			CacheAffinityReuses         int64     `json:"cache_affinity_reuses_24h"`
+			CacheAffinityMisses         int64     `json:"cache_affinity_misses_24h"`
 			CacheEligibleRequests       int64     `json:"cache_eligible_requests_24h"`
 			CacheHitRate                float64   `json:"cache_hit_rate"`
 			CacheTokenReuseRate         float64   `json:"cache_token_reuse_rate"`
 			CacheRequestHitRate         float64   `json:"cache_request_hit_rate"`
 			CacheUsageCoverage          float64   `json:"cache_usage_coverage"`
+			CacheAffinityMissRate       float64   `json:"cache_affinity_miss_rate"`
 			HourlyRequests              []int64   `json:"hourly_requests"`
 			HourlyCacheEligibleRequests []int64   `json:"hourly_cache_eligible_requests"`
 			HourlyInputTokens           []int64   `json:"hourly_input_tokens"`
@@ -1229,6 +1234,9 @@ func TestDashboardCacheMetricsUseSuccessfulConversationalUsageOnly(t *testing.T)
 			HourlyUsageSamples          []int64   `json:"hourly_usage_samples"`
 			HourlyCacheSamples          []int64   `json:"hourly_cache_samples"`
 			HourlyCacheRequestHits      []int64   `json:"hourly_cache_request_hits"`
+			HourlyCacheWarmupCandidates []int64   `json:"hourly_cache_warmup_candidates"`
+			HourlyCacheAffinityReuses   []int64   `json:"hourly_cache_affinity_reuses"`
+			HourlyCacheAffinityMisses   []int64   `json:"hourly_cache_affinity_misses"`
 			HourlyCacheTokenReuseRates  []float64 `json:"hourly_cache_token_reuse_rate"`
 			HourlyCacheRequestHitRates  []float64 `json:"hourly_cache_request_hit_rate"`
 			HourlyCacheUsageCoverage    []float64 `json:"hourly_cache_usage_coverage"`
@@ -1238,16 +1246,16 @@ func TestDashboardCacheMetricsUseSuccessfulConversationalUsageOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	data := envelope.Data
-	if data.Requests != 7 || data.SuccessRate != float64(6)*100/7 || data.AverageLatency != 200 || data.Tokens != 1160 {
+	if data.Requests != 8 || data.SuccessRate != float64(7)*100/8 || data.AverageLatency != 181 || data.Tokens != 1215 {
 		t.Fatalf("request summary = %+v", data)
 	}
-	if data.InputTokens != 400 || data.CachedTokens != 140 || data.UsageSamples != 4 || data.CacheSamples != 3 || data.CacheRequestHits != 2 || data.CacheEligibleRequests != 5 {
+	if data.InputTokens != 450 || data.CachedTokens != 140 || data.UsageSamples != 5 || data.CacheSamples != 4 || data.CacheRequestHits != 2 || data.CacheWarmupCandidates != 1 || data.CacheAffinityReuses != 2 || data.CacheAffinityMisses != 1 || data.CacheEligibleRequests != 6 {
 		t.Fatalf("cache summary = %+v", data)
 	}
-	if data.CacheHitRate != 35 || data.CacheTokenReuseRate != 35 || data.CacheRequestHitRate != float64(2)*100/3 || data.CacheUsageCoverage != 80 {
+	if data.CacheHitRate != float64(140)*100/450 || data.CacheTokenReuseRate != float64(140)*100/450 || data.CacheRequestHitRate != 50 || data.CacheUsageCoverage != float64(5)*100/6 || data.CacheAffinityMissRate != 50 {
 		t.Fatalf("cache rates = %+v", data)
 	}
-	if len(data.HourlyRequests) != 24 || len(data.HourlyCacheTokenReuseRates) != 24 || data.HourlyRequests[23] != 7 || data.HourlyCacheEligibleRequests[23] != 5 || data.HourlyInputTokens[23] != 400 || data.HourlyCachedTokens[23] != 140 || data.HourlyUsageSamples[23] != 4 || data.HourlyCacheSamples[23] != 3 || data.HourlyCacheRequestHits[23] != 2 || data.HourlyCacheTokenReuseRates[23] != 35 || data.HourlyCacheRequestHitRates[23] != float64(2)*100/3 || data.HourlyCacheUsageCoverage[23] != 80 {
+	if len(data.HourlyRequests) != 24 || len(data.HourlyCacheTokenReuseRates) != 24 || data.HourlyRequests[23] != 8 || data.HourlyCacheEligibleRequests[23] != 6 || data.HourlyInputTokens[23] != 450 || data.HourlyCachedTokens[23] != 140 || data.HourlyUsageSamples[23] != 5 || data.HourlyCacheSamples[23] != 4 || data.HourlyCacheRequestHits[23] != 2 || data.HourlyCacheWarmupCandidates[23] != 1 || data.HourlyCacheAffinityReuses[23] != 2 || data.HourlyCacheAffinityMisses[23] != 1 || data.HourlyCacheTokenReuseRates[23] != float64(140)*100/450 || data.HourlyCacheRequestHitRates[23] != 50 || data.HourlyCacheUsageCoverage[23] != float64(5)*100/6 {
 		t.Fatalf("latest hourly cache point = %+v", data)
 	}
 }
@@ -1406,14 +1414,19 @@ func (e *testEnvironment) request(t *testing.T, method, path string, body any, c
 }
 
 type memoryRepository struct {
-	mu       sync.Mutex
-	admins   map[string]*store.AdminRecord
-	sessions map[string]*store.AdminSession
-	accounts map[string]*domain.Account
-	keys     map[string]*domain.ClientKey
-	models   map[string]*domain.ModelSpec
-	proxies  map[string]*domain.Proxy
-	logs     map[string]*domain.RequestLog
+	mu                      sync.Mutex
+	admins                  map[string]*store.AdminRecord
+	sessions                map[string]*store.AdminSession
+	accounts                map[string]*domain.Account
+	accountListCalls        int
+	accountListErr          error
+	accountListContextErr   error
+	accountListHasDeadline  bool
+	accountBatchDeleteCalls int
+	keys                    map[string]*domain.ClientKey
+	models                  map[string]*domain.ModelSpec
+	proxies                 map[string]*domain.Proxy
+	logs                    map[string]*domain.RequestLog
 }
 
 func newMemoryRepository() *memoryRepository {
@@ -1608,9 +1621,15 @@ func (r *memoryRepository) GetAccount(_ context.Context, id string) (*domain.Acc
 	copy.CredentialCipher = append([]byte(nil), value.CredentialCipher...)
 	return &copy, nil
 }
-func (r *memoryRepository) ListAccounts(_ context.Context, filter store.AccountFilter) ([]domain.Account, error) {
+func (r *memoryRepository) ListAccounts(ctx context.Context, filter store.AccountFilter) ([]domain.Account, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.accountListCalls++
+	r.accountListContextErr = ctx.Err()
+	_, r.accountListHasDeadline = ctx.Deadline()
+	if r.accountListErr != nil {
+		return nil, r.accountListErr
+	}
 	var result []domain.Account
 	for _, value := range r.accounts {
 		if !matchesAccountFilter(value, filter) {
@@ -1654,6 +1673,12 @@ func (r *memoryRepository) CountAccounts(_ context.Context, filter store.Account
 
 func matchesAccountFilter(value *domain.Account, filter store.AccountFilter) bool {
 	if filter.Kind != "" && value.Kind != filter.Kind || filter.Status != "" && value.Status != filter.Status {
+		return false
+	}
+	if filter.Tier != "" && !strings.EqualFold(value.Tier, strings.TrimSpace(filter.Tier)) {
+		return false
+	}
+	if filter.ProxyID != nil && value.ProxyID != strings.TrimSpace(*filter.ProxyID) {
 		return false
 	}
 	if filter.Model != "" {
@@ -1718,6 +1743,20 @@ func (r *memoryRepository) DeleteAccount(_ context.Context, id string) error {
 		return store.ErrNotFound
 	}
 	delete(r.accounts, id)
+	return nil
+}
+func (r *memoryRepository) DeleteAccounts(_ context.Context, ids []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.accountBatchDeleteCalls++
+	for _, id := range ids {
+		if _, ok := r.accounts[id]; !ok {
+			return store.ErrNotFound
+		}
+	}
+	for _, id := range ids {
+		delete(r.accounts, id)
+	}
 	return nil
 }
 
@@ -1984,6 +2023,12 @@ func (r *memoryRepository) GetRequestLogStats(_ context.Context, from, to time.T
 		}
 		if store.CacheEligibleRequest(value.Endpoint, value.StatusCode) && value.UsageParsed && value.InputTokens > 0 {
 			cached := store.NormalizedCachedTokens(value.InputTokens, value.CachedTokens)
+			var cacheMetadata struct {
+				IdentityApplied     bool `json:"cache_identity_applied"`
+				AffinityReused      bool `json:"cache_affinity_reused"`
+				AffinityEstablished bool `json:"cache_affinity_established"`
+			}
+			_ = json.Unmarshal(value.Metadata, &cacheMetadata)
 			stats.CacheInputTokens += value.InputTokens
 			stats.CachedTokens += cached
 			stats.CacheSamples++
@@ -1993,6 +2038,18 @@ func (r *memoryRepository) GetRequestLogStats(_ context.Context, from, to time.T
 			if cached > 0 {
 				stats.CacheRequestHits++
 				hour.CacheRequestHits++
+			}
+			if cacheMetadata.AffinityEstablished && cached == 0 {
+				stats.CacheWarmupCandidates++
+				hour.CacheWarmupCandidates++
+			}
+			if cacheMetadata.AffinityReused {
+				stats.CacheAffinityReuses++
+				hour.CacheAffinityReuses++
+				if cached == 0 {
+					stats.CacheAffinityMisses++
+					hour.CacheAffinityMisses++
+				}
 			}
 		}
 	}

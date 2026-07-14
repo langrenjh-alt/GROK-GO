@@ -15,6 +15,7 @@ type AccountRepository interface {
 	UpdateAccount(context.Context, *domain.Account) error
 	UpdateAccounts(context.Context, []*domain.Account) error
 	DeleteAccount(context.Context, string) error
+	DeleteAccounts(context.Context, []string) error
 }
 
 type ModelRepository interface {

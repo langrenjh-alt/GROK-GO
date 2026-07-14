@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -60,6 +61,66 @@ func TestHTTPClientAdaptsConsoleAndParsesSSE(t *testing.T) {
 	}
 	if len(events) < 3 || events[0].Text != "hello" || events[1].Usage.InputTokens != 2 || events[2].Kind != EventDone {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestHTTPClientUsesOneIsolatedCacheIdentityInBodyAndHeader(t *testing.T) {
+	const (
+		isolatedKey = "55555555-5555-5555-8555-555555555555"
+		rawKey      = "raw-client-conversation"
+	)
+	for _, test := range []struct {
+		name        string
+		kind        domain.CredentialKind
+		credentials domain.Credentials
+		wantPath    string
+		wantCache   bool
+	}{
+		{name: "CLI OAuth", kind: domain.CredentialCLIOAuth, credentials: domain.Credentials{AccessToken: "access"}, wantPath: "/responses", wantCache: true},
+		{name: "Console SSO", kind: domain.CredentialConsoleSSO, credentials: domain.Credentials{SSO: "console-secret"}, wantPath: "/responses", wantCache: true},
+		{name: "Grok SSO", kind: domain.CredentialGrokSSO, credentials: domain.Credentials{SSO: "grok-secret"}, wantPath: "/rest/app-chat/conversations/new", wantCache: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var gotBody []byte
+			var gotHeader string
+			var gotPath string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotHeader = r.Header.Get("X-Grok-Conv-Id")
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Client: server.Client(), CLIBaseURL: server.URL,
+				ConsoleBaseURL: server.URL, GrokBaseURL: server.URL,
+			})
+			headers := make(http.Header)
+			headers.Set("X-Grok-Conv-Id", rawKey)
+			_, err := client.Do(context.Background(), Request{
+				Operation: OperationResponses, Model: "grok", UpstreamModel: "grok-4.5",
+				PromptCacheKey: isolatedKey, CredentialKind: test.kind, Credentials: test.credentials,
+				Body: json.RawMessage(`{"input":"hello","prompt_cache_key":"raw-body-key"}`), Headers: headers,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotPath != test.wantPath {
+				t.Fatalf("path = %q, want %q", gotPath, test.wantPath)
+			}
+			if bytes.Contains(gotBody, []byte(rawKey)) || bytes.Contains(gotBody, []byte("raw-body-key")) || gotHeader == rawKey {
+				t.Fatalf("raw client identity reached upstream: header=%q body=%s", gotHeader, gotBody)
+			}
+			if test.wantCache {
+				if gotHeader != isolatedKey || !bytes.Contains(gotBody, []byte(`"prompt_cache_key":"`+isolatedKey+`"`)) {
+					t.Fatalf("isolated identity mismatch: header=%q body=%s", gotHeader, gotBody)
+				}
+			} else if gotHeader != "" || bytes.Contains(gotBody, []byte(`"prompt_cache_key"`)) {
+				t.Fatalf("Grok web request contained Responses cache routing: header=%q body=%s", gotHeader, gotBody)
+			}
+		})
 	}
 }
 

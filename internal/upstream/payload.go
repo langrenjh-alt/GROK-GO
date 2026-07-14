@@ -60,8 +60,20 @@ func prepareResponsesPayload(request Request, source map[string]any, model strin
 	if request.CredentialKind == domain.CredentialConsoleSSO {
 		applyConsoleDefaults(result, source, request, model, toolsPresent)
 	}
-	if request.CredentialKind == domain.CredentialCLIOAuth && strings.TrimSpace(request.PromptCacheKey) != "" {
-		result["prompt_cache_key"] = strings.TrimSpace(request.PromptCacheKey)
+	cacheKey := strings.TrimSpace(request.PromptCacheKey)
+	switch request.CredentialKind {
+	case domain.CredentialCLIOAuth, domain.CredentialConsoleSSO:
+		if cacheKey != "" {
+			// Always replace a client-supplied value with the tenant-isolated
+			// identity derived by the gateway.
+			result["prompt_cache_key"] = cacheKey
+		} else {
+			delete(result, "prompt_cache_key")
+		}
+	default:
+		delete(result, "prompt_cache_key")
+	}
+	if request.CredentialKind == domain.CredentialCLIOAuth && cacheKey != "" {
 		_, choicePresent := source["tool_choice"]
 		if !toolsPresent && !choicePresent && len(normalizedTools) == 0 {
 			result["tools"] = []any{map[string]any{"type": "web_search"}, map[string]any{"type": "x_search"}}

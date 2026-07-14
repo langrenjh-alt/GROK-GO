@@ -29,6 +29,7 @@ async function apiRequest(path: string, init?: RequestInit): Promise<Response> {
   }
   return fetch(`${API_BASE}${path}`, {
     ...init,
+    cache: init?.cache ?? "no-store",
     credentials: "same-origin",
     headers,
   });

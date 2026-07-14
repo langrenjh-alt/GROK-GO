@@ -22,10 +22,21 @@ upstream.
 
 Each enabled model declares its upstream model, credential kind, capability,
 minimum account tier, and whether the highest available tier is preferred.
-Requests with an explicit session header, `prompt_cache_key`, supported
-metadata session, Anthropic cache anchor, or stable prompt prefix receive a
-tenant-isolated UUID-shaped cache identity. That identity is sent to cache-
-capable upstream routes and is also used for account affinity.
+GROK-GO derives two tenant-isolated, UUID-shaped identities. The session
+affinity key prefers an explicit session header, `prompt_cache_key`, supported
+metadata session, or Anthropic cache anchor, and otherwise falls back to a
+stable conversation prefix. The upstream prompt-cache key is derived
+separately from the normalized static prefix: model, system/instructions,
+developer messages, and tools. When no static prefix exists, the first user
+input is included to avoid concentrating every request in one routing bucket.
+
+CLI OAuth and Console SSO Responses requests receive the derived upstream key
+in `prompt_cache_key` and `X-Grok-Conv-Id`; client-provided raw values cannot
+override it. The private Grok SSO Web schema does not receive these fields.
+xAI still decides cache hits by exact prompt-prefix matching. The key improves
+sticky routing to a cache server; it does not make different prefixes share a
+cached response, and a missing key does not by itself disable automatic prompt
+caching.
 
 Account affinity is a routing optimization, not a local response cache. Redis
 refreshes the affinity TTL only when the stored account still matches, keeping
@@ -34,13 +45,18 @@ Cached-input token values reported by the upstream are normalized into usage
 metadata and dashboard cache metrics; response bodies are never shared between
 downstream API keys.
 
-The 24-hour dashboard response separates three cache measurements:
+The 24-hour dashboard response separates cache effectiveness, observability,
+and affinity-routing measurements:
 
 | Field | Definition |
 | --- | --- |
 | `cache_token_reuse_rate` | Normalized cached input tokens divided by input tokens for successful conversation requests with parsed usage and positive input |
 | `cache_request_hit_rate` | Requests with positive cached tokens divided by those same valid cache samples |
 | `cache_usage_coverage` | Successful conversation requests with parsed usage divided by all successful conversation requests |
+| `cache_warmup_candidates_24h` | Valid zero-cache samples that established a new account-affinity binding |
+| `cache_affinity_reuses_24h` | Valid samples that reused an existing account-affinity binding |
+| `cache_affinity_misses_24h` | Affinity reuses that still reported zero cached tokens |
+| `cache_affinity_miss_rate` | Affinity misses divided by affinity reuses |
 
 Conversation requests are `/v1/chat/completions`, `/v1/responses`, and
 `/v1/messages`. Failed requests and image/video endpoints are excluded from all
@@ -91,6 +107,33 @@ account array, token array, or token-pool object. Import responses report
 `imported`, `skipped`, and `failed` counts. Re-importing the same upstream
 credential is reported as skipped. Credential fingerprints are keyed and used
 only for duplicate detection; credentials remain AES-256-GCM encrypted.
+
+Import controls may be supplied as JSON fields, multipart fields, or query
+parameters. `initial_status` (with `status` as an alias) explicitly overrides
+the imported account state; `active` also clears an imported cooldown. The
+optional `post_import_action` accepts `none` (the API default), `refresh`, or
+`refresh_probe`. Post-import actions run only for newly created CLI OAuth
+accounts, use bounded concurrency and a request-wide timeout, and return a
+`post_action` summary with one result per processed account. An explicitly
+disabled account is preserved unless an initial status override activates it.
+
+For a Build OAuth multipart upload, the console sends the following controls by
+default. The account remains outside normal scheduling until both refresh and
+probe complete successfully:
+
+```bash
+curl -X POST 'https://HOST/admin/api/accounts/import' \
+  -H 'X-CSRF-Token: CSRF_TOKEN' \
+  -F 'initial_status=active' \
+  -F 'post_import_action=refresh_probe' \
+  -F 'files=@xai-ACCOUNT.json;type=application/json'
+```
+
+API clients that need the historical import-only behavior can send
+`post_import_action=none`. The same controls can be query parameters when the
+request body is one raw Build OAuth JSON object. A single existing account can
+be rechecked with `POST /admin/api/accounts/{id}/probe`; the batch endpoint is
+`POST /admin/api/accounts/probe` with `{ "ids": ["ACCOUNT_ID"] }`.
 
 Supported interchange forms are:
 

@@ -67,11 +67,11 @@ func TestRedisCoordinatorAffinityAndCooldownTTL(t *testing.T) {
 	if _, found, err := coordinator.GetAffinity(ctx, "grok", "thread"); err != nil || found {
 		t.Fatalf("unexpected initial affinity: found=%v err=%v", found, err)
 	}
-	if accountID, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-a", time.Minute); err != nil || accountID != "account-a" {
-		t.Fatalf("bind first affinity: account=%q err=%v", accountID, err)
+	if accountID, established, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-a", time.Minute); err != nil || accountID != "account-a" || !established {
+		t.Fatalf("bind first affinity: account=%q established=%t err=%v", accountID, established, err)
 	}
-	if accountID, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-b", time.Minute); err != nil || accountID != "account-a" {
-		t.Fatalf("existing affinity should win: account=%q err=%v", accountID, err)
+	if accountID, established, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-b", time.Minute); err != nil || accountID != "account-a" || established {
+		t.Fatalf("existing affinity should win: account=%q established=%t err=%v", accountID, established, err)
 	}
 
 	until := now.Add(45 * time.Second)
@@ -87,8 +87,8 @@ func TestRedisCoordinatorAffinityAndCooldownTTL(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Minute)
-	if accountID, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-b", time.Minute); err != nil || accountID != "account-b" {
-		t.Fatalf("expired affinity was not replaced: account=%q err=%v", accountID, err)
+	if accountID, established, err := coordinator.BindAffinity(ctx, "grok", "thread", "account-b", time.Minute); err != nil || accountID != "account-b" || !established {
+		t.Fatalf("expired affinity was not replaced: account=%q established=%t err=%v", accountID, established, err)
 	}
 	if _, cooling, err := coordinator.CooldownUntil(ctx, "account-a"); err != nil || cooling {
 		t.Fatalf("expired cooldown remained active: cooling=%v err=%v", cooling, err)
@@ -134,6 +134,207 @@ func TestPoolCoordinatorEnforcesCrossInstanceLeaseAndCooldown(t *testing.T) {
 		t.Fatalf("acquire after cooldown: %v", err)
 	}
 	if err := got.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPoolCoordinatorInvalidatesAffinityWhenAccountBecomesUnavailable(t *testing.T) {
+	tests := []struct {
+		name     string
+		feedback func(time.Time) Feedback
+	}{
+		{name: "rate limited", feedback: func(time.Time) Feedback {
+			return Feedback{StatusCode: 429, RetryAfter: time.Minute}
+		}},
+		{name: "quota exhausted", feedback: func(now time.Time) Feedback {
+			reset := now.Add(time.Hour)
+			quota := domain.QuotaSnapshot{RequestsLimit: 10, RequestsRemaining: 0, ResetAt: &reset, ObservedAt: now}
+			return Feedback{StatusCode: 200, Quota: &quota}
+		}},
+		{name: "credential disabled", feedback: func(time.Time) Feedback {
+			return Feedback{StatusCode: 401}
+		}},
+		{name: "transient upstream failure", feedback: func(time.Time) Feedback {
+			return Feedback{StatusCode: 503}
+		}},
+		{name: "protection challenge", feedback: func(time.Time) Feedback {
+			return Feedback{Err: errors.New("upstream protection challenge")}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(1_700_000_000, 0)
+			redis := newFakeRedis(func() time.Time { return now })
+			coordinator := NewRedisCoordinator(redis)
+			coordinator.now = func() time.Time { return now }
+			account := domain.Account{ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
+			store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "token"}})
+			pool := NewPoolWithCoordinator(store, DefaultPolicy(), coordinator)
+			pool.now = func() time.Time { return now }
+			selection := Selection{
+				Model:       domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}},
+				AffinityKey: "thread",
+			}
+
+			lease, err := pool.Acquire(context.Background(), selection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bound, found, err := coordinator.GetAffinity(context.Background(), "grok", "thread"); err != nil || !found || bound != account.ID {
+				t.Fatalf("initial affinity = %q, found=%t, err=%v", bound, found, err)
+			}
+			if err := lease.Release(context.Background(), test.feedback(now)); err != nil {
+				t.Fatal(err)
+			}
+			if bound, found, err := coordinator.GetAffinity(context.Background(), "grok", "thread"); err != nil || found {
+				t.Fatalf("unavailable affinity remained = %q, found=%t, err=%v", bound, found, err)
+			}
+			if _, cooling, err := coordinator.CooldownUntil(context.Background(), account.ID); err != nil || !cooling {
+				t.Fatalf("coordinated account block = %t, err=%v", cooling, err)
+			}
+			if _, err := pool.Acquire(context.Background(), selection); !errors.Is(err, ErrNoAccount) {
+				t.Fatalf("unavailable account was selected again: %v", err)
+			}
+		})
+	}
+}
+
+func TestPoolCoordinatorPublishesCurrentQuotaBlockWhenCredentialsChanged(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	redis := newFakeRedis(func() time.Time { return now })
+	coordinator := NewRedisCoordinator(redis)
+	coordinator.now = func() time.Time { return now }
+	account := domain.Account{
+		ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, HealthScore: 1, CredentialCipher: []byte("old-credential"),
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "old-token"}})
+	pool := NewPoolWithCoordinator(store, DefaultPolicy(), coordinator)
+	pool.now = func() time.Time { return now }
+	selection := Selection{
+		Model:       domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}},
+		AffinityKey: "thread",
+	}
+
+	lease, err := pool.Acquire(context.Background(), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset := now.Add(time.Hour)
+	account.CredentialCipher = []byte("new-credential")
+	account.Quota = domain.QuotaSnapshot{
+		RequestsLimit: 10, RequestsRemaining: 0, ResetAt: &reset, ObservedAt: now,
+	}
+	if err := store.UpdateAccount(context.Background(), account); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if bound, found, err := coordinator.GetAffinity(context.Background(), "grok", "thread"); err != nil || found {
+		t.Fatalf("quota-blocked affinity remained = %q, found=%t, err=%v", bound, found, err)
+	}
+	if until, cooling, err := coordinator.CooldownUntil(context.Background(), account.ID); err != nil || !cooling || !until.Equal(reset) {
+		t.Fatalf("coordinated quota block = %v, cooling=%t, err=%v; want %v", until, cooling, err, reset)
+	}
+}
+
+func TestPoolCapacityFallbackPreservesCoordinatedAffinity(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	redis := newFakeRedis(func() time.Time { return now })
+	coordinator := NewRedisCoordinator(redis)
+	coordinator.now = func() time.Time { return now }
+	accounts := []domain.Account{
+		{ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, Priority: 2, ConcurrencyLimit: 1, HealthScore: 1},
+		{ID: "account-b", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, Priority: 1, ConcurrencyLimit: 1, HealthScore: 1},
+	}
+	store := NewMemoryStore(accounts, map[string]domain.Credentials{
+		"account-a": {AccessToken: "a"},
+		"account-b": {AccessToken: "b"},
+	})
+	pool := NewPoolWithCoordinator(store, DefaultPolicy(), coordinator)
+	pool.now = func() time.Time { return now }
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	selection := Selection{Model: model, AffinityKey: "thread"}
+
+	bound, err := pool.Acquire(context.Background(), selection)
+	if err != nil || bound.Account.ID != "account-a" {
+		t.Fatalf("initial affinity lease = %+v, err=%v", bound, err)
+	}
+	if !bound.CacheAffinityEstablished {
+		t.Fatal("initial coordinated affinity was not reported as established")
+	}
+	if err := bound.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	hold, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil || hold.Account.ID != "account-a" {
+		t.Fatalf("capacity holder = %+v, err=%v", hold, err)
+	}
+	fallback, err := pool.Acquire(context.Background(), selection)
+	if err != nil || fallback.Account.ID != "account-b" {
+		t.Fatalf("capacity fallback = %+v, err=%v", fallback, err)
+	}
+	if fallback.AffinityReused || fallback.CacheAffinityEstablished {
+		t.Fatalf("capacity fallback flags = reused:%t established:%t", fallback.AffinityReused, fallback.CacheAffinityEstablished)
+	}
+	if accountID, found, err := coordinator.GetAffinity(context.Background(), model.ID, selection.AffinityKey); err != nil || !found || accountID != "account-a" {
+		t.Fatalf("capacity fallback rebound affinity = %q, found=%t, err=%v", accountID, found, err)
+	}
+	if err := fallback.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hold.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	reused, err := pool.Acquire(context.Background(), selection)
+	if err != nil || reused.Account.ID != "account-a" || !reused.AffinityReused {
+		t.Fatalf("affinity after capacity recovery = %+v, err=%v", reused, err)
+	}
+	_ = reused.Release(context.Background(), Feedback{StatusCode: 200})
+}
+
+func TestPoolPublishesCoordinatedCooldownBeforePersistenceCompletes(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	redis := newFakeRedis(func() time.Time { return now })
+	coordinatorA := NewRedisCoordinator(redis)
+	coordinatorB := NewRedisCoordinator(redis)
+	coordinatorA.now = func() time.Time { return now }
+	coordinatorB.now = func() time.Time { return now }
+	account := domain.Account{ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 2, HealthScore: 1}
+	store := &blockingAccountUpdateStore{
+		MemoryStore:   NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "token"}}),
+		updateStarted: make(chan struct{}),
+		releaseUpdate: make(chan struct{}),
+	}
+	poolA := NewPoolWithCoordinator(store, DefaultPolicy(), coordinatorA)
+	poolB := NewPoolWithCoordinator(store, DefaultPolicy(), coordinatorB)
+	poolA.now = func() time.Time { return now }
+	poolB.now = func() time.Time { return now }
+	selection := Selection{Model: domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}}
+	lease, err := poolA.Acquire(context.Background(), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		released <- lease.Release(context.Background(), Feedback{StatusCode: 429, RetryAfter: time.Minute})
+	}()
+	select {
+	case <-store.updateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("account persistence did not start")
+	}
+	if _, err := poolB.Acquire(context.Background(), selection); !errors.Is(err, ErrNoAccount) {
+		close(store.releaseUpdate)
+		t.Fatalf("peer selected account before blocked persistence completed: %v", err)
+	}
+	close(store.releaseUpdate)
+	if err := <-released; err != nil {
 		t.Fatal(err)
 	}
 }
@@ -267,6 +468,23 @@ func TestPoolCoordinatorFailsClosedAndRollsBackLocalReservation(t *testing.T) {
 	if err := lease.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type blockingAccountUpdateStore struct {
+	*MemoryStore
+	once          sync.Once
+	updateStarted chan struct{}
+	releaseUpdate chan struct{}
+}
+
+func (s *blockingAccountUpdateStore) UpdateAccount(ctx context.Context, account domain.Account) error {
+	s.once.Do(func() { close(s.updateStarted) })
+	select {
+	case <-s.releaseUpdate:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.MemoryStore.UpdateAccount(ctx, account)
 }
 
 type fakeRedisEntry struct {

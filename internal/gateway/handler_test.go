@@ -373,6 +373,66 @@ func TestGatewayFailsOverAcrossAllCredentialKindsBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestGatewayTreatsProtectionChallengeAsTransientAndRebindsAffinity(t *testing.T) {
+	models := NewStaticModelSource([]domain.ModelSpec{{
+		ID: "grok-chat", UpstreamModel: "grok-chat", Capability: domain.CapabilityChat, Enabled: true,
+		CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth},
+	}})
+	items := []domain.Account{
+		{ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, Priority: 2, ConcurrencyLimit: 1, HealthScore: 1},
+		{ID: "account-b", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, Priority: 1, ConcurrencyLimit: 1, HealthScore: 1},
+	}
+	store := accounts.NewMemoryStore(items, map[string]domain.Credentials{
+		"account-a": {AccessToken: "a"},
+		"account-b": {AccessToken: "b"},
+	})
+	pool := accounts.NewPool(store, accounts.DefaultPolicy())
+	var calls []string
+	client := upstream.ClientFunc(func(_ context.Context, request upstream.Request) (*upstream.Response, error) {
+		calls = append(calls, request.Credentials.AccessToken)
+		if request.Credentials.AccessToken == "a" {
+			return &upstream.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     http.Header{"Content-Type": {"text/html; charset=UTF-8"}, "Server": {"cloudflare"}},
+				Body:       json.RawMessage(`<!doctype html><html><head><title>Just a moment...</title></head><body>challenge</body></html>`),
+			}, nil
+		}
+		return &upstream.Response{StatusCode: http.StatusOK, Events: upstream.Events(
+			upstream.Event{Kind: upstream.EventTextDelta, Text: "ok"},
+			upstream.Event{Kind: upstream.EventDone},
+		)}, nil
+	})
+	handler, err := NewHandler(Config{Models: models, Accounts: pool, Upstream: client, MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-chat","messages":[{"role":"user","content":"hello"}]}`))
+		request.Header.Set("Session-Id", "thread")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"content":"ok"`) {
+			t.Fatalf("response = %d %s", response.Code, response.Body.String())
+		}
+	}
+	if want := []string{"a", "b", "b"}; !slices.Equal(calls, want) {
+		t.Fatalf("upstream calls = %v, want %v", calls, want)
+	}
+	challenged := store.Accounts["account-a"]
+	if challenged.Status != domain.AccountCooldown || challenged.CooldownUntil == nil || challenged.Status == domain.AccountDisabled {
+		t.Fatalf("protection challenge account state = %+v", challenged)
+	}
+	challengeResponse := &upstream.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Cf-Mitigated": {"challenge"}},
+	}
+	feedback := feedbackFromResponse(challengeResponse, nil)
+	if feedback.StatusCode != 0 || feedback.Err == nil || upstreamErrorMessage(challengeResponse) != "upstream protection challenge returned HTTP 403; check the account proxy and retry" {
+		t.Fatalf("protection challenge feedback = %+v", feedback)
+	}
+}
+
 func TestGatewayRefreshesCLIOAuthOnceBeforeFailover(t *testing.T) {
 	models := NewStaticModelSource([]domain.ModelSpec{{
 		ID: "grok-refresh", UpstreamModel: "grok-refresh", Capability: domain.CapabilityChat,

@@ -119,7 +119,7 @@ func (s *Service) Probe(ctx context.Context, accountID string, input Input) (Res
 	if lease.Account.ProxyID != "" && s.proxyURL != nil {
 		proxyURL, err = s.proxyURL(probeContext, lease.Account.ProxyID)
 		if err != nil {
-			return s.complete(started, lease, result, 0, fmt.Errorf("resolve account proxy: %w", err), nil)
+			return s.complete(started, lease, result, 0, errors.New("resolve account proxy failed"), nil)
 		}
 	}
 	payload, err := json.Marshal(map[string]any{
@@ -142,7 +142,7 @@ func (s *Service) Probe(ctx context.Context, accountID string, input Input) (Res
 		Stream:         false,
 	})
 	if requestErr != nil {
-		return s.complete(started, lease, result, 0, fmt.Errorf("upstream request failed: %w", requestErr), nil)
+		return s.complete(started, lease, result, 0, upstreamRequestFailure(requestErr), nil)
 	}
 	if response == nil {
 		return s.complete(started, lease, result, 0, errors.New("upstream returned no response"), nil)
@@ -209,7 +209,13 @@ func (s *Service) complete(started time.Time, lease *accounts.Lease, result Resu
 		result.Message = cleanMessage(probeErr.Error())
 	}
 	feedbackStatus := statusCode
-	if feedbackStatus == 0 {
+	var challenge *upstreamProtectionChallengeError
+	if errors.As(probeErr, &challenge) {
+		// An edge challenge rejects this network/client attempt, not the
+		// credential itself. Feed it back as a transient failure so a 403
+		// challenge does not permanently disable the selected account.
+		feedbackStatus = 0
+	} else if feedbackStatus == 0 {
 		feedbackStatus = http.StatusBadGateway
 	}
 	feedback := accounts.HTTPFeedback(feedbackStatus, header, probeErr, result.CompletedAt)
@@ -257,7 +263,7 @@ func validateResponse(ctx context.Context, response *upstream.Response) error {
 			return errors.New("upstream returned an invalid JSON response")
 		}
 		if value, ok := payload["error"]; ok && value != nil {
-			return errors.New(responseErrorValue(value))
+			return errors.New("upstream returned an error payload")
 		}
 		return nil
 	}
@@ -277,11 +283,7 @@ func validateResponse(ctx context.Context, response *upstream.Response) error {
 			switch event.Kind {
 			case upstream.EventError:
 				drainEvents(response.Events)
-				message := strings.TrimSpace(event.Error)
-				if message == "" {
-					message = "upstream returned an error event"
-				}
-				return errors.New(message)
+				return errors.New("upstream returned an error event")
 			case upstream.EventTextDelta, upstream.EventReasoningDelta, upstream.EventToolCall,
 				upstream.EventImage, upstream.EventVideo, upstream.EventUsage, upstream.EventDone:
 				seen = true
@@ -298,40 +300,58 @@ func drainEvents(events <-chan upstream.Event) {
 }
 
 func upstreamResponseError(response *upstream.Response) error {
-	detail := ""
 	body := bytes.TrimSpace(response.Body)
-	if len(body) > 0 {
-		var payload map[string]any
-		if json.Unmarshal(body, &payload) == nil {
-			if value, ok := payload["error"]; ok {
-				detail = responseErrorValue(value)
-			} else if value, ok := payload["message"]; ok {
-				detail = fmt.Sprint(value)
-			}
-		}
-		if detail == "" {
-			detail = string(body)
-		}
+	if isUpstreamProtectionChallenge(response, body) {
+		return &upstreamProtectionChallengeError{statusCode: response.StatusCode}
 	}
+	detail := http.StatusText(response.StatusCode)
 	if detail == "" {
-		detail = http.StatusText(response.StatusCode)
+		return fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
 	}
-	return fmt.Errorf("upstream returned HTTP %d: %s", response.StatusCode, cleanMessage(detail))
+	return fmt.Errorf("upstream returned HTTP %d: %s", response.StatusCode, detail)
 }
 
-func responseErrorValue(value any) string {
-	switch value := value.(type) {
-	case string:
-		return value
-	case map[string]any:
-		for _, key := range []string{"message", "detail", "error", "code"} {
-			if text, ok := value[key].(string); ok && strings.TrimSpace(text) != "" {
-				return text
-			}
-		}
+func upstreamRequestFailure(err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.New("upstream request timed out")
+	case errors.Is(err, context.Canceled):
+		return errors.New("upstream request was canceled")
+	default:
+		return errors.New("upstream request failed")
 	}
-	encoded, _ := json.Marshal(value)
-	return string(encoded)
+}
+
+type upstreamProtectionChallengeError struct {
+	statusCode int
+}
+
+func (e *upstreamProtectionChallengeError) Error() string {
+	return fmt.Sprintf("upstream protection challenge returned HTTP %d; check the account proxy and retry", e.statusCode)
+}
+
+func isUpstreamProtectionChallenge(response *upstream.Response, body []byte) bool {
+	if response == nil || response.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(response.Header.Get("CF-Mitigated")), "challenge") {
+		return true
+	}
+	lowerBody := strings.ToLower(string(body))
+	if strings.Contains(lowerBody, "challenges.cloudflare.com") ||
+		strings.Contains(lowerBody, "cf-chl-") ||
+		strings.Contains(lowerBody, "<title>just a moment...</title>") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(response.Header.Get("Server")), "cloudflare") && looksLikeHTML(response.Header, body)
+}
+
+func looksLikeHTML(header http.Header, body []byte) bool {
+	if strings.Contains(strings.ToLower(header.Get("Content-Type")), "text/html") {
+		return true
+	}
+	lowerBody := strings.ToLower(string(bytes.TrimSpace(body)))
+	return strings.HasPrefix(lowerBody, "<!doctype html") || strings.HasPrefix(lowerBody, "<html")
 }
 
 func cleanMessage(value string) string {

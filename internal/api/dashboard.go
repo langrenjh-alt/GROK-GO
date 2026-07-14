@@ -46,6 +46,9 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	hourlyUsageSamples := make([]int64, 24)
 	hourlyCacheSamples := make([]int64, 24)
 	hourlyCacheRequestHits := make([]int64, 24)
+	hourlyCacheWarmupCandidates := make([]int64, 24)
+	hourlyCacheAffinityReuses := make([]int64, 24)
+	hourlyCacheAffinityMisses := make([]int64, 24)
 	hourlyCacheHitRate := make([]float64, 24)
 	hourlyCacheRequestHitRate := make([]float64, 24)
 	hourlyCacheUsageCoverage := make([]float64, 24)
@@ -61,6 +64,9 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		hourlyUsageSamples[index] = item.UsageSamples
 		hourlyCacheSamples[index] = item.CacheSamples
 		hourlyCacheRequestHits[index] = item.CacheRequestHits
+		hourlyCacheWarmupCandidates[index] = item.CacheWarmupCandidates
+		hourlyCacheAffinityReuses[index] = item.CacheAffinityReuses
+		hourlyCacheAffinityMisses[index] = item.CacheAffinityMisses
 		hourlyCacheHitRate[index] = store.CacheHitRate(item.CachedTokens, item.InputTokens)
 		hourlyCacheRequestHitRate[index] = store.CacheRequestHitRate(item.CacheRequestHits, item.CacheSamples)
 		hourlyCacheUsageCoverage[index] = store.CacheUsageCoverage(item.UsageSamples, item.CacheEligibleRequests)
@@ -85,11 +91,15 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		"usage_samples_24h":              stats.UsageSamples,
 		"cache_samples_24h":              stats.CacheSamples,
 		"cache_request_hits_24h":         stats.CacheRequestHits,
+		"cache_warmup_candidates_24h":    stats.CacheWarmupCandidates,
+		"cache_affinity_reuses_24h":      stats.CacheAffinityReuses,
+		"cache_affinity_misses_24h":      stats.CacheAffinityMisses,
 		"cache_eligible_requests_24h":    stats.CacheEligibleRequests,
 		"cache_hit_rate":                 cacheTokenReuseRate,
 		"cache_token_reuse_rate":         cacheTokenReuseRate,
 		"cache_request_hit_rate":         store.CacheRequestHitRate(stats.CacheRequestHits, stats.CacheSamples),
 		"cache_usage_coverage":           store.CacheUsageCoverage(stats.UsageSamples, stats.CacheEligibleRequests),
+		"cache_affinity_miss_rate":       store.CacheAffinityMissRate(stats.CacheAffinityMisses, stats.CacheAffinityReuses),
 		"active_accounts":                activeAccounts,
 		"total_accounts":                 totalAccounts,
 		"active_keys":                    activeKeys,
@@ -101,6 +111,9 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		"hourly_usage_samples":           hourlyUsageSamples,
 		"hourly_cache_samples":           hourlyCacheSamples,
 		"hourly_cache_request_hits":      hourlyCacheRequestHits,
+		"hourly_cache_warmup_candidates": hourlyCacheWarmupCandidates,
+		"hourly_cache_affinity_reuses":   hourlyCacheAffinityReuses,
+		"hourly_cache_affinity_misses":   hourlyCacheAffinityMisses,
 		"hourly_cache_hit_rate":          hourlyCacheHitRate,
 		"hourly_cache_token_reuse_rate":  hourlyCacheHitRate,
 		"hourly_cache_request_hit_rate":  hourlyCacheRequestHitRate,

@@ -28,6 +28,9 @@ func TestPoolScoresLeasesAndKeepsAffinity(t *testing.T) {
 	if first.Account.ID != "b" {
 		t.Fatalf("expected high-quota account b, got %s", first.Account.ID)
 	}
+	if !first.CacheIdentityApplied || first.AffinityReused || !first.CacheAffinityEstablished {
+		t.Fatalf("first affinity lease flags = applied:%v reused:%v established:%v", first.CacheIdentityApplied, first.AffinityReused, first.CacheAffinityEstablished)
+	}
 	if err := first.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +42,33 @@ func TestPoolScoresLeasesAndKeepsAffinity(t *testing.T) {
 	if second.Account.ID != "b" {
 		t.Fatalf("expected affinity to account b, got %s", second.Account.ID)
 	}
+	if !second.CacheIdentityApplied || !second.AffinityReused || second.CacheAffinityEstablished {
+		t.Fatalf("reused affinity lease flags = applied:%v reused:%v established:%v", second.CacheIdentityApplied, second.AffinityReused, second.CacheAffinityEstablished)
+	}
 	_ = second.Release(context.Background(), Feedback{StatusCode: 200})
+}
+
+func TestPoolDoesNotReportAffinityForNonAffinityStrategies(t *testing.T) {
+	for _, strategy := range []Strategy{StrategyPriority, StrategyRoundRobin} {
+		t.Run(string(strategy), func(t *testing.T) {
+			account := domain.Account{ID: "account", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
+			store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{account.ID: {AccessToken: "token"}})
+			policy := DefaultPolicy()
+			policy.Strategy = strategy
+			pool := NewPool(store, policy)
+			lease, err := pool.Acquire(context.Background(), Selection{
+				Model:       domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}},
+				AffinityKey: "cache-identity",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease.CacheIdentityApplied || lease.AffinityReused || lease.CacheAffinityEstablished {
+				t.Fatalf("non-affinity strategy flags = applied:%v reused:%v established:%v", lease.CacheIdentityApplied, lease.AffinityReused, lease.CacheAffinityEstablished)
+			}
+			_ = lease.Release(context.Background(), Feedback{StatusCode: 200})
+		})
+	}
 }
 
 func TestPoolScoreUsesLowestBoundedRequestOrTokenQuota(t *testing.T) {
@@ -474,6 +503,150 @@ func TestPoolReloadAppliesManualDisableAndConcurrencyImmediately(t *testing.T) {
 	_ = first.Release(context.Background(), Feedback{StatusCode: 200})
 }
 
+func TestPoolReloadRemovesDeletedAccountWithInflightLease(t *testing.T) {
+	account := domain.Account{
+		ID: "deleted", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 2, HealthScore: 1,
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{
+		account.ID: {AccessToken: "token"},
+	})
+	pool := NewPool(store, DefaultPolicy())
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	delete(store.Accounts, account.ID)
+	store.mu.Unlock()
+	if err := pool.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Errorf("deleted account remained schedulable while an old lease was inflight: %v", err)
+	}
+
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.RLock()
+	_, recreated := store.Accounts[account.ID]
+	store.mu.RUnlock()
+	if recreated {
+		t.Fatal("releasing an old lease recreated the deleted account")
+	}
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Fatalf("deleted account became schedulable after releasing its old lease: %v", err)
+	}
+}
+
+func TestPoolReloadSerializesSnapshotsSoDeletedAccountStaysRemoved(t *testing.T) {
+	account := domain.Account{
+		ID: "deleted-during-reload", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, HealthScore: 1,
+	}
+	memoryStore := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{
+		account.ID: {AccessToken: "token"},
+	})
+	store := &blockingReloadStore{
+		MemoryStore:         memoryStore,
+		firstSnapshotTaken:  make(chan struct{}),
+		releaseFirst:        make(chan struct{}),
+		secondSnapshotTaken: make(chan struct{}),
+	}
+	pool := NewPool(store, DefaultPolicy())
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- pool.Reload(context.Background())
+	}()
+	select {
+	case <-store.firstSnapshotTaken:
+	case <-time.After(time.Second):
+		t.Fatal("first Reload did not capture its snapshot")
+	}
+
+	memoryStore.mu.Lock()
+	delete(memoryStore.Accounts, account.ID)
+	memoryStore.mu.Unlock()
+
+	secondCalling := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondCalling)
+		secondDone <- pool.Reload(context.Background())
+	}()
+	<-secondCalling
+
+	secondReadBeforeRelease := false
+	select {
+	case <-store.secondSnapshotTaken:
+		secondReadBeforeRelease = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	if secondReadBeforeRelease {
+		// Make the stale first snapshot apply last if Reload permits overlapping
+		// ListAccounts and reconciliation operations.
+		if err := <-secondDone; err != nil {
+			t.Fatalf("second Reload: %v", err)
+		}
+	}
+	close(store.releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Reload: %v", err)
+	}
+	if !secondReadBeforeRelease {
+		if err := <-secondDone; err != nil {
+			t.Fatalf("second Reload: %v", err)
+		}
+	}
+	if secondReadBeforeRelease {
+		t.Error("second Reload read a new snapshot before the first Reload finished applying its snapshot")
+	}
+
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Fatalf("an older Reload re-added the deleted account: %v", err)
+	}
+}
+
+func TestPoolReloadWaitingForAnotherReloadHonorsContext(t *testing.T) {
+	memoryStore := NewMemoryStore(nil, nil)
+	store := &blockingReloadStore{
+		MemoryStore:         memoryStore,
+		firstSnapshotTaken:  make(chan struct{}),
+		releaseFirst:        make(chan struct{}),
+		secondSnapshotTaken: make(chan struct{}),
+	}
+	pool := NewPool(store, DefaultPolicy())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- pool.Reload(context.Background()) }()
+	select {
+	case <-store.firstSnapshotTaken:
+	case <-time.After(time.Second):
+		t.Fatal("first Reload did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := pool.Reload(ctx); err != context.DeadlineExceeded {
+		close(store.releaseFirst)
+		t.Fatalf("queued Reload error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-store.secondSnapshotTaken:
+		close(store.releaseFirst)
+		t.Fatal("canceled Reload reached the store")
+	default:
+	}
+	close(store.releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPoolSteadySuccessCoalescesLastUsedPersistence(t *testing.T) {
 	account := domain.Account{ID: "steady", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 8, HealthScore: 1}
 	store := &countingAccountStore{MemoryStore: NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"steady": {AccessToken: "token"}})}
@@ -536,6 +709,40 @@ func TestPoolPublishesPersistentFailureAndRecoveryChanges(t *testing.T) {
 type countingAccountStore struct {
 	*MemoryStore
 	updates int
+}
+
+type blockingReloadStore struct {
+	*MemoryStore
+
+	callsMu             sync.Mutex
+	calls               int
+	firstSnapshotTaken  chan struct{}
+	releaseFirst        chan struct{}
+	secondSnapshotTaken chan struct{}
+}
+
+func (s *blockingReloadStore) ListAccounts(ctx context.Context) ([]domain.Account, error) {
+	s.callsMu.Lock()
+	s.calls++
+	call := s.calls
+	s.callsMu.Unlock()
+
+	items, err := s.MemoryStore.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	switch call {
+	case 1:
+		close(s.firstSnapshotTaken)
+		select {
+		case <-s.releaseFirst:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	case 2:
+		close(s.secondSnapshotTaken)
+	}
+	return items, nil
 }
 
 type recordingAccountNotifier struct {
