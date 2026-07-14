@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	minRequestBytes = 1 << 20
-	maxRequestBytes = 1 << 30
+	minRequestBytes      = 1 << 20
+	maxRequestBytes      = 1 << 30
+	maxGlobalConcurrency = 1_000_000
 )
 
 // Values is the complete, validated service-settings snapshot. Keep this type
@@ -61,8 +62,8 @@ func (v Values) Validate() error {
 	if v.MaxRequestBytes < minRequestBytes || v.MaxRequestBytes > maxRequestBytes {
 		return fieldError("max_request_bytes", fmt.Errorf("must be between %d and %d", minRequestBytes, maxRequestBytes))
 	}
-	if v.MaxConcurrency < 1 || v.MaxConcurrency > 10_000 {
-		return fieldError("max_concurrency", errors.New("must be between 1 and 10000"))
+	if v.MaxConcurrency < 1 || v.MaxConcurrency > maxGlobalConcurrency {
+		return fieldError("max_concurrency", fmt.Errorf("must be between 1 and %d", maxGlobalConcurrency))
 	}
 	if v.LogRetentionDays < 1 || v.LogRetentionDays > 3650 {
 		return fieldError("log_retention_days", errors.New("must be between 1 and 3650"))

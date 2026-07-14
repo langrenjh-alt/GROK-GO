@@ -17,6 +17,7 @@ func TestApplyPatchRejectsUnknownTypesAndBounds(t *testing.T) {
 		{name: "wrong type", patch: `{"max_concurrency":"32"}`, want: "JSON integer"},
 		{name: "fraction", patch: `{"request_timeout_seconds":1.5}`, want: "JSON integer"},
 		{name: "too small", patch: `{"max_request_bytes":1024}`, want: "between"},
+		{name: "concurrency too large", patch: `{"max_concurrency":1000001}`, want: "between 1 and 1000000"},
 		{name: "invalid origin", patch: `{"cors_origins":"https://ok.test/path"}`, want: "invalid origin"},
 	}
 	for _, test := range tests {
@@ -29,6 +30,20 @@ func TestApplyPatchRejectsUnknownTypesAndBounds(t *testing.T) {
 				t.Fatalf("ApplyPatch() error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestApplyPatchAcceptsMillionRequestConcurrency(t *testing.T) {
+	var patch map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(`{"max_concurrency":1000000}`), &patch); err != nil {
+		t.Fatal(err)
+	}
+	configured, changed, err := ApplyPatch(Defaults(), patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.MaxConcurrency != maxGlobalConcurrency || changed["max_concurrency"] != maxGlobalConcurrency {
+		t.Fatalf("max concurrency patch = configured:%d changed:%v", configured.MaxConcurrency, changed["max_concurrency"])
 	}
 }
 

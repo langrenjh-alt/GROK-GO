@@ -192,6 +192,7 @@ describe("SettingsView administrator credentials", () => {
     expect(await screen.findByText("Restart required")).toBeVisible();
     await user.click(screen.getByRole("tab", { name: "Limits" }));
     const concurrency = screen.getByLabelText("Global Concurrency");
+    expect(concurrency).toHaveAttribute("max", "1000000");
     await user.clear(concurrency);
     await user.type(concurrency, "48");
     await user.click(screen.getByRole("button", { name: /^Save/ }));

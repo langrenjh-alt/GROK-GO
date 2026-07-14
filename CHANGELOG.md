@@ -2,6 +2,13 @@
 
 All notable changes to GROK-GO are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Raised the configurable process-wide gateway concurrency ceiling from 10,000
+  to 1,000,000 without changing the default of 32.
+
 ## [0.1.2] - 2026-07-14
 
 ### Added
@@ -131,6 +138,7 @@ All notable changes to GROK-GO are documented in this file.
 
 - Initial GROK-GO release.
 
+[Unreleased]: https://github.com/langrenjh-alt/GROK-GO/compare/v0.1.2...HEAD
 [0.1.2]: https://github.com/langrenjh-alt/GROK-GO/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/langrenjh-alt/GROK-GO/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/langrenjh-alt/GROK-GO/releases/tag/v0.1.0
