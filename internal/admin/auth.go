@@ -364,6 +364,16 @@ func (s *AuthService) ChangePassword(ctx context.Context, adminID, currentPasswo
 	return s.repo.DeleteAdminSessionsForAdmin(ctx, admin.ID)
 }
 
+// VerifyCredentials performs step-up authentication for sensitive administrator
+// operations without issuing or revoking a session.
+func (s *AuthService) VerifyCredentials(ctx context.Context, adminID, password, totpCode string) error {
+	admin, err := s.repo.GetAdminByID(ctx, strings.TrimSpace(adminID))
+	if err != nil {
+		return err
+	}
+	return s.verifyAdminCredentials(admin, password, totpCode)
+}
+
 func (s *AuthService) verifyAdminCredentials(admin *store.AdminRecord, password, totpCode string) error {
 	if len(password) > 4096 {
 		return ErrInvalidCredentials

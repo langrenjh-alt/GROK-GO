@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 
@@ -37,11 +39,15 @@ type accountRequest struct {
 	UserAgent        string                `json:"user_agent"`
 	BaseURL          string                `json:"base_url"`
 	Disabled         bool                  `json:"disabled"`
+	Status           domain.AccountStatus  `json:"status"`
 	ProxyID          string                `json:"proxy_id"`
 	Models           []string              `json:"models"`
 	Tags             []string              `json:"tags"`
 	Priority         int                   `json:"priority"`
 	ConcurrencyLimit int                   `json:"concurrency_limit"`
+	Quota            domain.QuotaSnapshot  `json:"quota"`
+	CooldownUntil    *time.Time            `json:"cooldown_until"`
+	LastError        string                `json:"last_error"`
 }
 
 type accountPatchRequest struct {
@@ -85,6 +91,7 @@ func (h *Handler) mountAccounts(router chi.Router) {
 	router.Get("/accounts", h.listAccounts)
 	router.Post("/accounts", h.createAccount)
 	router.Post("/accounts/import", h.importAccounts)
+	router.Post("/accounts/export", h.exportAccounts)
 	router.Get("/accounts/quota-summary", h.accountQuotaSummary)
 	router.Get("/accounts/policy", h.getAccountPolicy)
 	router.Put("/accounts/policy", h.updateAccountPolicy)
@@ -142,6 +149,14 @@ func (h *Handler) batchUpdateAccounts(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if request.Status != nil && *request.Status == domain.AccountActive && h.config.Accounts != nil {
+		for _, accountID := range request.IDs {
+			if err := h.config.Accounts.ClearCooldown(r.Context(), accountID); err != nil {
+				writeServiceError(w, err)
+				return
+			}
+		}
 	}
 	if err := h.reloadAccounts(r.Context()); err != nil {
 		writeServiceError(w, err)
@@ -212,7 +227,8 @@ func (h *Handler) accountQuotaSummary(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	available := make([]domain.Account, 0, len(items))
 	for _, item := range items {
-		if item.Status == domain.AccountActive && (item.CooldownUntil == nil || !item.CooldownUntil.After(now)) || item.Status == domain.AccountCooldown && item.CooldownUntil != nil && !item.CooldownUntil.After(now) {
+		statusAvailable := item.Status == domain.AccountActive && (item.CooldownUntil == nil || !item.CooldownUntil.After(now)) || item.Status == domain.AccountCooldown && item.CooldownUntil != nil && !item.CooldownUntil.After(now)
+		if statusAvailable && !accountpool.QuotaUnavailableUntil(item.Quota, item.Kind, now).After(now) {
 			available = append(available, item)
 		}
 	}
@@ -409,6 +425,12 @@ func (h *Handler) updateAccount(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	if request.Status != nil && *request.Status == domain.AccountActive && h.config.Accounts != nil {
+		if err := h.config.Accounts.ClearCooldown(r.Context(), chi.URLParam(r, "id")); err != nil {
+			writeServiceError(w, err)
+			return
+		}
+	}
 	if err := h.reloadAccounts(r.Context()); err != nil {
 		writeServiceError(w, err)
 		return
@@ -474,15 +496,113 @@ func splitCredentials(value string) []string {
 	return values
 }
 
+type importCredential struct {
+	Token    string
+	Tags     []string
+	Note     string
+	Tier     string
+	Status   string
+	Disabled bool
+}
+
+type importCredentialList []importCredential
+
+func (s *importCredentialList) UnmarshalJSON(data []byte) error {
+	var value string
+	if json.Unmarshal(data, &value) == nil {
+		*s = importCredentialsFromText(value)
+		return nil
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(data, &rawItems); err != nil {
+		return err
+	}
+	values := make([]importCredential, 0, len(rawItems))
+	for _, raw := range rawItems {
+		if json.Unmarshal(raw, &value) == nil {
+			values = append(values, importCredentialsFromText(value)...)
+			continue
+		}
+		var item struct {
+			Token    string   `json:"token"`
+			SSO      string   `json:"sso"`
+			Tags     []string `json:"tags"`
+			Note     string   `json:"note"`
+			Tier     string   `json:"tier"`
+			Pool     string   `json:"pool"`
+			Status   string   `json:"status"`
+			Disabled bool     `json:"disabled"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return err
+		}
+		token := normalizeImportedCredential(firstNonEmpty(item.Token, item.SSO))
+		if token != "" {
+			values = append(values, importCredential{
+				Token: token, Tags: uniqueStrings(item.Tags), Note: strings.TrimSpace(item.Note),
+				Tier: firstNonEmpty(item.Tier, item.Pool), Status: strings.TrimSpace(item.Status), Disabled: item.Disabled,
+			})
+		}
+	}
+	*s = values
+	return nil
+}
+
+func importCredentialsFromText(value string) []importCredential {
+	tokens := splitCredentials(value)
+	result := make([]importCredential, 0, len(tokens))
+	for _, token := range tokens {
+		if token = normalizeImportedCredential(token); token != "" {
+			result = append(result, importCredential{Token: token})
+		}
+	}
+	return result
+}
+
+func normalizeImportedCredential(value string) string {
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '\ufeff', '\u200b', '\u200c', '\u200d', '\u2060':
+			return -1
+		case '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212':
+			return '-'
+		default:
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}
+	}, value)
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "sso=")
+	return strings.TrimSpace(value)
+}
+
+func normalizeImportTier(value string) string {
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "", "auto", "basic", "ssobasic":
+		return "basic"
+	case "super", "ssosuper":
+		return "super"
+	case "heavy", "ssoheavy":
+		return "heavy"
+	default:
+		return trimmed
+	}
+}
+
 type importRequest struct {
 	Accounts         []accountRequest      `json:"accounts"`
-	Tokens           stringList            `json:"tokens"`
+	Tokens           importCredentialList  `json:"tokens"`
 	Token            string                `json:"token"`
-	Basic            stringList            `json:"basic"`
-	SSOBasic         stringList            `json:"ssobasic"`
-	Auto             stringList            `json:"auto"`
-	Super            stringList            `json:"super"`
-	Heavy            stringList            `json:"heavy"`
+	Basic            importCredentialList  `json:"basic"`
+	SSOBasic         importCredentialList  `json:"ssoBasic"`
+	Auto             importCredentialList  `json:"auto"`
+	Super            importCredentialList  `json:"super"`
+	SSOSuper         importCredentialList  `json:"ssoSuper"`
+	Heavy            importCredentialList  `json:"heavy"`
+	SSOHeavy         importCredentialList  `json:"ssoHeavy"`
 	Kind             domain.CredentialKind `json:"kind"`
 	Tier             string                `json:"tier"`
 	Pool             string                `json:"pool"`
@@ -492,23 +612,29 @@ type importRequest struct {
 }
 
 type buildOAuthImportRecord struct {
-	Type          string            `json:"type"`
-	AuthKind      string            `json:"auth_kind"`
-	Email         string            `json:"email"`
-	Subject       string            `json:"sub"`
-	AccessToken   string            `json:"access_token"`
-	RefreshToken  string            `json:"refresh_token"`
-	IDToken       string            `json:"id_token"`
-	TokenType     string            `json:"token_type"`
-	ExpiresIn     *int64            `json:"expires_in"`
-	Expired       string            `json:"expired"`
-	LastRefresh   string            `json:"last_refresh"`
-	RedirectURI   string            `json:"redirect_uri"`
-	TokenEndpoint string            `json:"token_endpoint"`
-	BaseURL       string            `json:"base_url"`
-	Disabled      bool              `json:"disabled"`
-	Headers       map[string]string `json:"headers"`
+	Type          string          `json:"type"`
+	AuthKind      string          `json:"auth_kind"`
+	Email         string          `json:"email"`
+	Subject       string          `json:"sub"`
+	AccessToken   string          `json:"access_token"`
+	RefreshToken  string          `json:"refresh_token"`
+	IDToken       string          `json:"id_token"`
+	TokenType     string          `json:"token_type"`
+	ExpiresIn     *int64          `json:"expires_in"`
+	Expired       string          `json:"expired"`
+	LastRefresh   string          `json:"last_refresh"`
+	RedirectURI   string          `json:"redirect_uri"`
+	TokenEndpoint string          `json:"token_endpoint"`
+	BaseURL       string          `json:"base_url"`
+	Disabled      bool            `json:"disabled"`
+	CooldownUntil *int64          `json:"cooldown_until"`
+	Headers       json.RawMessage `json:"headers"`
 }
+
+const (
+	xAICLIBaseURL      = "https://cli-chat-proxy.grok.com/v1"
+	xAIOfficialBaseURL = "https://api.x.ai/v1"
+)
 
 func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 	if !h.requireManagement(w) {
@@ -520,40 +646,80 @@ func (h *Handler) importAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Token != "" {
-		request.Tokens = append(request.Tokens, request.Token)
+		request.Tokens = append(request.Tokens, importCredentialsFromText(request.Token)...)
 	}
 	for _, pair := range []struct {
 		tier   string
-		values stringList
-	}{{"basic", request.Basic}, {"basic", request.SSOBasic}, {"basic", request.Auto}, {"super", request.Super}, {"heavy", request.Heavy}} {
-		for _, token := range pair.values {
-			request.Accounts = append(request.Accounts, importedAccount(token, request.Kind, pair.tier, request))
+		values importCredentialList
+	}{{"basic", request.Basic}, {"basic", request.SSOBasic}, {"basic", request.Auto}, {"super", request.Super}, {"super", request.SSOSuper}, {"heavy", request.Heavy}, {"heavy", request.SSOHeavy}} {
+		for _, credential := range pair.values {
+			request.Accounts = append(request.Accounts, importedCredentialAccount(credential, request.Kind, pair.tier, request))
 		}
 	}
-	tier := firstNonEmpty(request.Tier, request.Pool, "basic")
-	for _, token := range request.Tokens {
-		request.Accounts = append(request.Accounts, importedAccount(token, request.Kind, tier, request))
+	tier := normalizeImportTier(firstNonEmpty(request.Tier, request.Pool, "basic"))
+	for _, credential := range request.Tokens {
+		request.Accounts = append(request.Accounts, importedCredentialAccount(credential, request.Kind, firstNonEmpty(credential.Tier, tier), request))
 	}
 	applyImportDefaults(&request, tier)
 	if len(request.Accounts) == 0 {
 		writeAPIError(w, http.StatusBadRequest, "empty_import", "No accounts or tokens were supplied.")
 		return
 	}
+	existing, err := h.allAccounts(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	seenCredentials := make(map[string]struct{}, len(existing)+len(request.Accounts))
+	for _, account := range existing {
+		if len(account.CredentialFingerprint) > 0 {
+			seenCredentials[string(account.CredentialFingerprint)] = struct{}{}
+			continue
+		}
+		credentials, credentialErr := h.config.Management.GetAccountCredentials(r.Context(), account.ID)
+		if credentialErr != nil {
+			writeServiceError(w, credentialErr)
+			return
+		}
+		if fingerprint := h.config.Management.AccountCredentialFingerprint(account.Kind, credentials); len(fingerprint) > 0 {
+			seenCredentials[string(fingerprint)] = struct{}{}
+		}
+	}
 	result := struct {
+		Status   string           `json:"status"`
+		Count    int              `json:"count"`
 		Imported int              `json:"imported"`
+		Skipped  int              `json:"skipped"`
 		Failed   int              `json:"failed"`
 		Items    []domain.Account `json:"items"`
 		Errors   []string         `json:"errors,omitempty"`
-	}{}
+	}{Status: "success"}
 	for _, item := range request.Accounts {
-		created, err := h.config.Management.CreateAccount(r.Context(), item.createInput())
+		input := item.createInput()
+		fingerprint := h.config.Management.AccountCredentialFingerprint(input.Kind, input.Credentials)
+		if len(fingerprint) > 0 {
+			if _, duplicate := seenCredentials[string(fingerprint)]; duplicate {
+				result.Skipped++
+				continue
+			}
+		}
+		created, err := h.config.Management.CreateAccount(r.Context(), input)
 		if err != nil {
+			if len(fingerprint) > 0 && errors.Is(err, store.ErrConflict) && strings.Contains(err.Error(), "accounts_credential_fingerprint_unique") {
+				result.Skipped++
+				seenCredentials[string(fingerprint)] = struct{}{}
+				continue
+			}
 			result.Failed++
 			result.Errors = append(result.Errors, err.Error())
 			continue
 		}
 		result.Imported++
+		result.Count++
 		result.Items = append(result.Items, *created)
+		if len(fingerprint) > 0 {
+			seenCredentials[string(fingerprint)] = struct{}{}
+		}
 	}
 	if result.Imported > 0 {
 		if err := h.reloadAccounts(r.Context()); err != nil {
@@ -595,9 +761,9 @@ func (h *Handler) decodeImportRequest(w http.ResponseWriter, r *http.Request, de
 	destination.Priority, _ = strconv.Atoi(r.FormValue("priority"))
 	destination.ConcurrencyLimit, _ = strconv.Atoi(r.FormValue("concurrency_limit"))
 	destination.Tags = splitCredentials(r.FormValue("tags"))
-	destination.Tokens = append(destination.Tokens, splitCredentials(r.FormValue("tokens"))...)
+	destination.Tokens = append(destination.Tokens, importCredentialsFromText(r.FormValue("tokens"))...)
 	if token := strings.TrimSpace(r.FormValue("token")); token != "" {
-		destination.Tokens = append(destination.Tokens, token)
+		destination.Tokens = append(destination.Tokens, importCredentialsFromText(token)...)
 	}
 	for _, files := range r.MultipartForm.File {
 		for _, header := range files {
@@ -640,7 +806,7 @@ func parseImportData(data []byte) (importRequest, error) {
 		for _, raw := range items {
 			var token string
 			if json.Unmarshal(raw, &token) == nil {
-				result.Tokens = append(result.Tokens, token)
+				result.Tokens = append(result.Tokens, importCredentialsFromText(token)...)
 				continue
 			}
 			account, err := parseImportAccount(raw)
@@ -651,13 +817,16 @@ func parseImportData(data []byte) (importRequest, error) {
 		}
 		return result, nil
 	}
-	return importRequest{Tokens: splitCredentials(string(data))}, nil
+	return importRequest{Tokens: importCredentialsFromText(string(data))}, nil
 }
 
 func parseImportObject(data []byte) (importRequest, error) {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil {
 		return importRequest{}, err
+	}
+	if result, matched, err := parseInteroperableAccountEnvelope(data, object); matched || err != nil {
+		return result, err
 	}
 	if isBuildOAuthImport(object) {
 		account, err := parseBuildOAuthAccount(data)
@@ -704,15 +873,27 @@ func parseImportAccount(data []byte) (accountRequest, error) {
 	}
 	if _, compatibleToken := object["token"]; compatibleToken {
 		var compat struct {
-			Token string                `json:"token"`
-			Pool  string                `json:"pool"`
-			Tier  string                `json:"tier"`
-			Kind  domain.CredentialKind `json:"kind"`
+			Token    string                `json:"token"`
+			Pool     string                `json:"pool"`
+			Tier     string                `json:"tier"`
+			Kind     domain.CredentialKind `json:"kind"`
+			Tags     []string              `json:"tags"`
+			Note     string                `json:"note"`
+			Status   string                `json:"status"`
+			Disabled bool                  `json:"disabled"`
 		}
 		if err := json.Unmarshal(data, &compat); err != nil {
 			return accountRequest{}, err
 		}
-		return importedAccount(compat.Token, compat.Kind, firstNonEmpty(compat.Tier, compat.Pool, "basic"), importRequest{}), nil
+		return importedCredentialAccount(
+			importCredential{
+				Token: compat.Token, Tags: compat.Tags, Note: compat.Note,
+				Status: compat.Status, Disabled: compat.Disabled,
+			},
+			compat.Kind,
+			normalizeImportTier(firstNonEmpty(compat.Tier, compat.Pool, "basic")),
+			importRequest{},
+		), nil
 	}
 	var account accountRequest
 	if err := strictJSON(data, &account); err != nil {
@@ -726,22 +907,46 @@ func isBuildOAuthImport(object map[string]json.RawMessage) bool {
 	_, hasRefresh := object["refresh_token"]
 	_, hasAuthKind := object["auth_kind"]
 	_, hasType := object["type"]
-	return (hasAccess || hasRefresh) && (hasAuthKind || hasType)
+	if (hasAccess || hasRefresh) && (hasAuthKind || hasType) {
+		return true
+	}
+	if !hasAccess || !hasRefresh {
+		return false
+	}
+	for _, field := range []string{"kind", "name", "credentials", "tier", "pool"} {
+		if _, isGenericAccount := object[field]; isGenericAccount {
+			return false
+		}
+	}
+	return true
 }
 
 func parseBuildOAuthAccount(data []byte) (accountRequest, error) {
 	var record buildOAuthImportRecord
-	if err := strictJSON(data, &record); err != nil {
-		return accountRequest{}, err
+	if err := json.Unmarshal(data, &record); err != nil {
+		return accountRequest{}, errors.New("OAuth import record has an invalid JSON schema")
 	}
 	if value := strings.TrimSpace(record.Type); value != "" && !strings.EqualFold(value, "xai") {
-		return accountRequest{}, errors.New("unsupported OAuth import record type")
+		return accountRequest{}, errors.New("OAuth import record type must be xai")
 	}
 	if value := strings.TrimSpace(record.AuthKind); value != "" && !strings.EqualFold(value, "oauth") {
-		return accountRequest{}, errors.New("unsupported OAuth import authentication kind")
+		return accountRequest{}, errors.New("OAuth import record authentication kind must be oauth")
 	}
-	if strings.TrimSpace(record.AccessToken) == "" && strings.TrimSpace(record.RefreshToken) == "" {
-		return accountRequest{}, errors.New("OAuth import record contains no credentials")
+	accessToken := strings.TrimSpace(record.AccessToken)
+	refreshToken := strings.TrimSpace(record.RefreshToken)
+	if accessToken == "" || refreshToken == "" {
+		return accountRequest{}, errors.New("OAuth import record requires both access and refresh tokens")
+	}
+	tokenType := strings.TrimSpace(record.TokenType)
+	if tokenType == "" {
+		tokenType = "Bearer"
+	} else if !strings.EqualFold(tokenType, "Bearer") {
+		return accountRequest{}, errors.New("OAuth import record token type must be Bearer")
+	}
+	tokenType = "Bearer"
+	baseURL, err := normalizeBuildOAuthBaseURL(record.BaseURL)
+	if err != nil {
+		return accountRequest{}, err
 	}
 	expiresAt, err := buildOAuthExpiry(record)
 	if err != nil {
@@ -756,24 +961,58 @@ func parseBuildOAuthAccount(data []byte) (accountRequest, error) {
 		name = "Imported xAI OAuth"
 	}
 	credentials := domain.Credentials{
-		AccessToken: strings.TrimSpace(record.AccessToken), RefreshToken: strings.TrimSpace(record.RefreshToken),
-		IDToken: strings.TrimSpace(record.IDToken), TokenType: strings.TrimSpace(record.TokenType),
-		ExpiresAt: expiresAt, UserID: strings.TrimSpace(record.Subject), BaseURL: strings.TrimSpace(record.BaseURL),
+		AccessToken: accessToken, RefreshToken: refreshToken,
+		IDToken: strings.TrimSpace(record.IDToken), TokenType: tokenType,
+		ExpiresAt: expiresAt, UserID: strings.TrimSpace(record.Subject), BaseURL: baseURL,
 		Email: email,
 	}
-	return accountRequest{Name: name, Kind: domain.CredentialCLIOAuth, Email: email, Credentials: &credentials, Disabled: record.Disabled}, nil
+	status := domain.AccountActive
+	var cooldownUntil *time.Time
+	if record.CooldownUntil != nil && *record.CooldownUntil > time.Now().Unix() {
+		value := time.Unix(*record.CooldownUntil, 0).UTC()
+		status, cooldownUntil = domain.AccountCooldown, &value
+	}
+	if record.Disabled {
+		status, cooldownUntil = domain.AccountDisabled, nil
+	}
+	return accountRequest{Name: name, Kind: domain.CredentialCLIOAuth, Email: email, Credentials: &credentials, Status: status, CooldownUntil: cooldownUntil}, nil
+}
+
+func normalizeBuildOAuthBaseURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return xAICLIBaseURL, nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Port() != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(value, "#") {
+		return "", errors.New("OAuth import record base URL must use an official xAI endpoint")
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") || parsed.Hostname() == "" || !strings.EqualFold(parsed.Host, parsed.Hostname()) {
+		return "", errors.New("OAuth import record base URL must use an official xAI endpoint")
+	}
+	if parsed.Path != "/v1" && parsed.Path != "/v1/" {
+		return "", errors.New("OAuth import record base URL must use an official xAI endpoint")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "cli-chat-proxy.grok.com" && host != "api.x.ai" {
+		return "", errors.New("OAuth import record base URL must use an official xAI endpoint")
+	}
+	return xAICLIBaseURL, nil
 }
 
 func buildOAuthExpiry(record buildOAuthImportRecord) (time.Time, error) {
 	if value := strings.TrimSpace(record.Expired); value != "" {
-		expiresAt, err := time.Parse(time.RFC3339, value)
+		expiresAt, err := time.Parse(time.RFC3339Nano, value)
 		if err != nil {
 			return time.Time{}, errors.New("OAuth import record has an invalid expiration time")
 		}
 		return expiresAt, nil
 	}
 	if record.ExpiresIn != nil && *record.ExpiresIn > 0 && strings.TrimSpace(record.LastRefresh) != "" {
-		refreshedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(record.LastRefresh))
+		if *record.ExpiresIn > int64((time.Duration(1<<63-1))/time.Second) {
+			return time.Time{}, errors.New("OAuth import record expiration interval is invalid")
+		}
+		refreshedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(record.LastRefresh))
 		if err != nil {
 			return time.Time{}, errors.New("OAuth import record has an invalid refresh time")
 		}
@@ -803,9 +1042,8 @@ func applyImportDefaults(request *importRequest, tier string) {
 		if account.Kind == "" {
 			account.Kind = request.Kind
 		}
-		if strings.TrimSpace(account.Tier) == "" && strings.TrimSpace(account.Pool) == "" {
-			account.Tier = tier
-		}
+		account.Tier = normalizeImportTier(firstNonEmpty(account.Tier, account.Pool, tier))
+		account.Pool = ""
 		account.Tags = uniqueStrings(append(account.Tags, request.Tags...))
 		if account.Priority == 0 {
 			account.Priority = request.Priority
@@ -823,7 +1061,9 @@ func mergeImportRequest(destination *importRequest, source importRequest) {
 	destination.SSOBasic = append(destination.SSOBasic, source.SSOBasic...)
 	destination.Auto = append(destination.Auto, source.Auto...)
 	destination.Super = append(destination.Super, source.Super...)
+	destination.SSOSuper = append(destination.SSOSuper, source.SSOSuper...)
 	destination.Heavy = append(destination.Heavy, source.Heavy...)
+	destination.SSOHeavy = append(destination.SSOHeavy, source.SSOHeavy...)
 	if destination.Kind == "" {
 		destination.Kind = source.Kind
 	}
@@ -865,10 +1105,7 @@ func (h *Handler) deleteTokens(w http.ResponseWriter, r *http.Request) {
 	if !h.requireManagement(w) {
 		return
 	}
-	var request struct {
-		IDs    stringList `json:"ids"`
-		Tokens stringList `json:"tokens"`
-	}
+	var request tokenDeleteRequest
 	if err := h.decodeJSON(w, r, &request); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
@@ -886,7 +1123,7 @@ func (h *Handler) deleteTokens(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, credential := range []string{credentials.SSO, credentials.SSORW, credentials.AccessToken} {
-			if normalized := strings.TrimSpace(strings.TrimPrefix(credential, "sso=")); normalized != "" {
+			if normalized := normalizeImportedCredential(credential); normalized != "" {
 				accountByCredential[normalized] = item.ID
 			}
 		}
@@ -897,7 +1134,7 @@ func (h *Handler) deleteTokens(w http.ResponseWriter, r *http.Request) {
 			deleted++
 			continue
 		}
-		normalized := strings.TrimSpace(strings.TrimPrefix(identifier, "sso="))
+		normalized := normalizeImportedCredential(identifier)
 		if accountID, ok := accountByCredential[normalized]; ok {
 			if h.config.Management.DeleteAccount(r.Context(), accountID) == nil {
 				deleted++
@@ -913,6 +1150,27 @@ func (h *Handler) deleteTokens(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
+type tokenDeleteRequest struct {
+	IDs    stringList `json:"ids"`
+	Tokens stringList `json:"tokens"`
+}
+
+func (r *tokenDeleteRequest) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '[' {
+		var identifiers stringList
+		if err := json.Unmarshal(data, &identifiers); err != nil {
+			return err
+		}
+		r.Tokens = identifiers
+		return nil
+	}
+	type requestAlias tokenDeleteRequest
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode((*requestAlias)(r))
+}
+
 func (r accountRequest) createInput() admin.CreateAccountInput {
 	credentials := domain.Credentials{}
 	if r.Credentials != nil {
@@ -920,11 +1178,14 @@ func (r accountRequest) createInput() admin.CreateAccountInput {
 	}
 	mergeCredentials(&credentials, r.AccessToken, r.RefreshToken, r.IDToken, r.SSO, r.SSORW, r.UserID, r.CFClearance, r.UserAgent, r.BaseURL)
 	tier := firstNonEmpty(r.Tier, r.Pool)
-	status := domain.AccountActive
+	status := r.Status
+	if status == "" {
+		status = domain.AccountActive
+	}
 	if r.Disabled {
 		status = domain.AccountDisabled
 	}
-	return admin.CreateAccountInput{Name: r.Name, Kind: r.Kind, Tier: tier, Status: status, Email: r.Email, Credentials: credentials, ProxyID: r.ProxyID, Models: r.Models, Tags: r.Tags, Priority: r.Priority, ConcurrencyLimit: r.ConcurrencyLimit}
+	return admin.CreateAccountInput{Name: r.Name, Kind: r.Kind, Tier: tier, Status: status, Email: r.Email, Credentials: credentials, ProxyID: r.ProxyID, Models: r.Models, Tags: r.Tags, Priority: r.Priority, ConcurrencyLimit: r.ConcurrencyLimit, Quota: r.Quota, CooldownUntil: r.CooldownUntil, LastError: r.LastError}
 }
 
 func (h *Handler) accountUpdateInput(ctx context.Context, id string, request accountPatchRequest) (admin.UpdateAccountInput, error) {
@@ -957,7 +1218,7 @@ func importedAccount(token string, kind domain.CredentialKind, tier string, requ
 	if kind == "" {
 		kind = domain.CredentialGrokSSO
 	}
-	token = strings.TrimSpace(strings.TrimPrefix(token, "sso="))
+	token = normalizeImportedCredential(token)
 	item := accountRequest{Name: "Imported " + maskedToken(token), Kind: kind, Tier: tier, Tags: request.Tags, Priority: request.Priority, ConcurrencyLimit: request.ConcurrencyLimit}
 	if kind == domain.CredentialCLIOAuth {
 		item.AccessToken = token
@@ -965,6 +1226,51 @@ func importedAccount(token string, kind domain.CredentialKind, tier string, requ
 		item.SSO, item.SSORW = token, token
 	}
 	return item
+}
+
+func importedCredentialAccount(credential importCredential, kind domain.CredentialKind, tier string, request importRequest) accountRequest {
+	item := importedAccount(credential.Token, kind, normalizeImportTier(tier), request)
+	status, tags := grok2APIImportMetadata(credential.Status, credential.Tags)
+	item.Tags = uniqueStrings(append(item.Tags, tags...))
+	if note := strings.TrimSpace(credential.Note); note != "" {
+		item.Name = note
+	}
+	switch status {
+	case "cooling", "cooldown":
+		until := time.Now().UTC().Add(15 * time.Minute)
+		item.Status, item.CooldownUntil = domain.AccountCooldown, &until
+	case "disabled":
+		item.Status = domain.AccountDisabled
+	case "invalid", "error":
+		item.Status = domain.AccountError
+	case "expired":
+		item.Status = domain.AccountExpired
+	}
+	if credential.Disabled {
+		item.Status, item.CooldownUntil = domain.AccountDisabled, nil
+	}
+	return item
+}
+
+func grok2APIImportMetadata(status string, tags []string) (string, []string) {
+	status = strings.ToLower(strings.TrimSpace(status))
+	cleaned := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		trimmed := strings.TrimSpace(tag)
+		const prefix = "grok-go-status:"
+		if strings.HasPrefix(strings.ToLower(trimmed), prefix) {
+			candidate := strings.ToLower(strings.TrimSpace(trimmed[len(prefix):]))
+			switch candidate {
+			case "active", "cooling", "cooldown", "disabled", "invalid", "error", "expired":
+				if status == "" {
+					status = candidate
+				}
+				continue
+			}
+		}
+		cleaned = append(cleaned, trimmed)
+	}
+	return status, uniqueStrings(cleaned)
 }
 
 func mergeCredentials(destination *domain.Credentials, access, refresh, idToken, sso, ssoRW, userID, clearance, userAgent, baseURL string) {

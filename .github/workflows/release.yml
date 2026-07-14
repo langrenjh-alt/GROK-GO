@@ -34,14 +34,14 @@ jobs:
       GROK_GO_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/grok_go?sslmode=disable
       GROK_GO_TEST_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.5'
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 10.33.3
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: pnpm
@@ -63,7 +63,7 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
-          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Build
         env:
           CGO_ENABLED: '0'
@@ -78,7 +78,26 @@ jobs:
           go build -trimpath -ldflags "$ldflags" -o bin/grok-go-linux-amd64 ./cmd/grok-go
           cd bin
           sha256sum grok-go-linux-amd64 > checksums.txt
-      - uses: softprops/action-gh-release@v2
+      - name: Verify single-file startup
+        env:
+          GROK_GO_LISTEN_ADDR: 127.0.0.1:18080
+          GROK_GO_PUBLIC_URL: http://127.0.0.1:18080
+          GROK_GO_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/grok_go?sslmode=disable
+          GROK_GO_REDIS_URL: redis://127.0.0.1:6379/0
+          GROK_GO_MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+          GROK_GO_BOOTSTRAP_TOKEN: release-bootstrap-token
+          GROK_GO_DATA_DIR: /tmp/grok-go-release-data
+        run: |
+          bin/grok-go-linux-amd64 >/tmp/grok-go-release.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:18080/readyz && break
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/readyz | grep '"status":"ready"'
+          curl --fail --silent http://127.0.0.1:18080/login/ | grep '<!DOCTYPE html>'
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true

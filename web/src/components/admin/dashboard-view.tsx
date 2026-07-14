@@ -20,7 +20,13 @@ interface DashboardData {
   input_tokens_24h: number;
   cached_tokens_24h: number;
   usage_samples_24h: number;
+  cache_samples_24h: number;
+  cache_request_hits_24h: number;
+  cache_eligible_requests_24h: number;
   cache_hit_rate: number;
+  cache_token_reuse_rate: number;
+  cache_request_hit_rate: number;
+  cache_usage_coverage: number;
   active_accounts: number;
   total_accounts: number;
   active_keys: number;
@@ -29,7 +35,9 @@ interface DashboardData {
   hourly_input_tokens: number[];
   hourly_cached_tokens: number[];
   hourly_usage_samples: number[];
+  hourly_cache_samples: number[];
   hourly_cache_hit_rate: number[];
+  hourly_cache_token_reuse_rate: number[];
   recent_logs: RequestLog[];
 }
 
@@ -43,7 +51,13 @@ const initialDashboard: DashboardData = {
   input_tokens_24h: 0,
   cached_tokens_24h: 0,
   usage_samples_24h: 0,
+  cache_samples_24h: 0,
+  cache_request_hits_24h: 0,
+  cache_eligible_requests_24h: 0,
   cache_hit_rate: 0,
+  cache_token_reuse_rate: 0,
+  cache_request_hit_rate: 0,
+  cache_usage_coverage: 0,
   active_accounts: 0,
   total_accounts: 0,
   active_keys: 0,
@@ -52,7 +66,9 @@ const initialDashboard: DashboardData = {
   hourly_input_tokens: emptyHours(),
   hourly_cached_tokens: emptyHours(),
   hourly_usage_samples: emptyHours(),
+  hourly_cache_samples: emptyHours(),
   hourly_cache_hit_rate: emptyHours(),
+  hourly_cache_token_reuse_rate: emptyHours(),
   recent_logs: [],
 };
 
@@ -82,10 +98,10 @@ function CacheTrend({ rates, inputTokens, cachedTokens, samples, locale }: { rat
   return (
     <div className="mt-5 border-t border-border pt-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2 text-copy-13 text-fg-muted"><span className="size-1.5 shrink-0 rounded-full bg-green" /><span className="truncate">{locale === "zh" ? "缓存命中趋势" : "Cache hit trend"}</span></div>
-        <span className="shrink-0 text-[11px] text-fg-subtle">{locale === "zh" ? "按有效用量加权" : "Weighted by valid usage"}</span>
+        <div className="flex min-w-0 items-center gap-2 text-copy-13 text-fg-muted"><span className="size-1.5 shrink-0 rounded-full bg-green" /><span className="truncate">{locale === "zh" ? "缓存 Token 复用趋势" : "Cache token reuse trend"}</span></div>
+        <span className="shrink-0 text-[11px] text-fg-subtle">{locale === "zh" ? "成功对话请求" : "Successful conversations"}</span>
       </div>
-      <div role="img" aria-label={locale === "zh" ? "过去 24 小时缓存命中率趋势" : "Cache hit rate over the last 24 hours"} className="mt-3 flex h-14 items-end gap-1 border-b border-border">
+      <div role="img" aria-label={locale === "zh" ? "过去 24 小时缓存 Token 复用率趋势" : "Cache token reuse rate over the last 24 hours"} className="mt-3 flex h-14 items-end gap-1 border-b border-border">
         {rates.map((rate, index) => {
           const valid = samples[index] > 0;
           const title = valid
@@ -106,11 +122,17 @@ export function DashboardView() {
   const hourlyRequests = hourSeries(data.hourly_requests);
   const hourlyInputTokens = hourSeries(data.hourly_input_tokens);
   const hourlyCachedTokens = hourSeries(data.hourly_cached_tokens);
-  const hourlyUsageSamples = hourSeries(data.hourly_usage_samples);
-  const hourlyCacheHitRate = hourSeries(data.hourly_cache_hit_rate, 100);
+  const hourlyCacheSamples = hourSeries(data.hourly_cache_samples ?? data.hourly_usage_samples);
+  const hourlyCacheTokenReuseRate = hourSeries(data.hourly_cache_token_reuse_rate ?? data.hourly_cache_hit_rate, 100);
   const recentLogs = data.recent_logs ?? [];
   const maxBar = Math.max(...hourlyRequests, 1);
-  const cacheDetail = data.usage_samples_24h > 0
+  const cacheTokenReuseRate = data.cache_token_reuse_rate ?? data.cache_hit_rate ?? 0;
+  const cacheSamples = data.cache_samples_24h ?? data.usage_samples_24h ?? 0;
+  const cacheRequestHits = data.cache_request_hits_24h ?? 0;
+  const cacheRequestHitRate = data.cache_request_hit_rate ?? 0;
+  const cacheEligibleRequests = data.cache_eligible_requests_24h ?? 0;
+  const cacheUsageCoverage = data.cache_usage_coverage ?? 0;
+  const cacheDetail = cacheSamples > 0
     ? `${formatNumber(data.cached_tokens_24h)} / ${formatNumber(data.input_tokens_24h)} ${locale === "zh" ? "输入 Token" : "input tokens"}`
     : locale === "zh" ? "暂无有效 usage" : "No valid usage";
   return (
@@ -122,7 +144,7 @@ export function DashboardView() {
         <Stat label={locale === "zh" ? "成功率" : "Success Rate"} value={`${data.success_rate.toFixed(2)}%`} detail={locale === "zh" ? "所有公开端点" : "All public endpoints"} icon={ShieldCheck} />
         <Stat label={locale === "zh" ? "平均延迟" : "Average Latency"} value={`${formatNumber(data.avg_latency_ms)} ms`} detail={locale === "zh" ? "端到端平均值" : "End-to-end average"} icon={Clock3} />
         <Stat label={locale === "zh" ? "Token 用量" : "Token Usage"} value={formatNumber(data.tokens_24h)} detail={locale === "zh" ? "输入与输出合计" : "Input and output"} icon={Activity} />
-        <Stat className="col-span-2 border-b-0 md:col-span-1 md:border-r-0" label={locale === "zh" ? "缓存命中率" : "Cache Hit Rate"} value={`${data.cache_hit_rate.toFixed(1)}%`} detail={cacheDetail} icon={Database} accent />
+        <Stat className="col-span-2 border-b-0 md:col-span-1 md:border-r-0" label={locale === "zh" ? "缓存 Token 复用率" : "Cache Token Reuse Rate"} value={`${cacheTokenReuseRate.toFixed(1)}%`} detail={cacheDetail} icon={Database} accent />
       </section>
       <div className="grid border-b border-border lg:grid-cols-[minmax(0,1.5fr)_minmax(320px,1fr)]">
         <section aria-labelledby="traffic-heading" className="bg-surface px-4 py-5 sm:px-6 lg:border-r lg:border-border lg:px-8">
@@ -131,7 +153,11 @@ export function DashboardView() {
             {hourlyRequests.map((value, index) => <div key={index} title={`${formatNumber(value)} ${locale === "zh" ? "次请求" : "requests"}`} className="min-h-px flex-1 rounded-t-[2px] bg-blue-700 opacity-80 transition-opacity hover:opacity-100" style={{ height: `${Math.max(1, (value / maxBar) * 100)}%` }} />)}
           </div>
           <div className="mt-2 flex justify-between text-[11px] text-fg-subtle"><span>{locale === "zh" ? "24 小时前" : "24h ago"}</span><span>{locale === "zh" ? "12 小时前" : "12h ago"}</span><span>{locale === "zh" ? "当前" : "Now"}</span></div>
-          <CacheTrend rates={hourlyCacheHitRate} inputTokens={hourlyInputTokens} cachedTokens={hourlyCachedTokens} samples={hourlyUsageSamples} locale={locale} />
+          <CacheTrend rates={hourlyCacheTokenReuseRate} inputTokens={hourlyInputTokens} cachedTokens={hourlyCachedTokens} samples={hourlyCacheSamples} locale={locale} />
+          <div className="mt-4 grid grid-cols-2 divide-x divide-border border-y border-border">
+            <div className="min-w-0 py-3 pr-4"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "缓存请求命中率" : "Request Hit Rate"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheRequestHitRate.toFixed(1)}%</strong><p className="truncate text-copy-13 text-fg-subtle">{formatNumber(cacheRequestHits)} / {formatNumber(cacheSamples)} {locale === "zh" ? "次请求" : "requests"}</p></div>
+            <div className="min-w-0 py-3 pl-4"><p className="text-label-13 text-fg-muted">{locale === "zh" ? "Usage 覆盖率" : "Usage Coverage"}</p><strong className="mt-1 block font-mono text-heading-20 tabular-nums text-fg">{cacheUsageCoverage.toFixed(1)}%</strong><p className="truncate text-copy-13 text-fg-subtle">{formatNumber(data.usage_samples_24h)} / {formatNumber(cacheEligibleRequests)} {locale === "zh" ? "次请求" : "requests"}</p></div>
+          </div>
         </section>
         <section aria-labelledby="capacity-heading" className="bg-surface px-4 py-5 sm:px-6 lg:px-8">
           <h2 id="capacity-heading" className="text-heading-16 font-semibold">{locale === "zh" ? "当前容量" : "Current Capacity"}</h2><p className="text-copy-13 text-fg-muted">{locale === "zh" ? "可调度资源" : "Schedulable resources"}</p>

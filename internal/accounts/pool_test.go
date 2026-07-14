@@ -42,6 +42,26 @@ func TestPoolScoresLeasesAndKeepsAffinity(t *testing.T) {
 	_ = second.Release(context.Background(), Feedback{StatusCode: 200})
 }
 
+func TestPoolScoreUsesLowestBoundedRequestOrTokenQuota(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	items := []domain.Account{
+		{ID: "token-low", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1, Quota: domain.QuotaSnapshot{RequestsLimit: 100, RequestsRemaining: 90, TokensLimit: 1000, TokensRemaining: 10}},
+		{ID: "balanced", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1, Quota: domain.QuotaSnapshot{RequestsLimit: 100, RequestsRemaining: 60, TokensLimit: 1000, TokensRemaining: 600}},
+	}
+	store := NewMemoryStore(items, map[string]domain.Credentials{"token-low": {AccessToken: "a"}, "balanced": {AccessToken: "b"}})
+	pool := NewPool(store, DefaultPolicy())
+	pool.now = func() time.Time { return now }
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Account.ID != "balanced" {
+		t.Fatalf("quota-aware selection chose %q, want balanced", lease.Account.ID)
+	}
+	_ = lease.Release(context.Background(), Feedback{StatusCode: 200})
+}
+
 func TestPoolEnforcesConcurrencyAndCooldown(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	account := domain.Account{ID: "a", Kind: domain.CredentialConsoleSSO, Status: domain.AccountActive, ConcurrencyLimit: 1}
@@ -71,6 +91,100 @@ func TestPoolEnforcesConcurrencyAndCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = got.Release(context.Background(), Feedback{StatusCode: 200})
+}
+
+func TestPoolConcurrentSuccessDoesNotEraseRateLimitCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	account := domain.Account{ID: "a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 2, HealthScore: 1}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"a": {AccessToken: "token"}})
+	pool := NewPool(store, DefaultPolicy())
+	pool.now = func() time.Time { return now }
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+
+	limited, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	olderSuccess, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := limited.Release(context.Background(), Feedback{StatusCode: 429, RetryAfter: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := olderSuccess.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	stored := store.Accounts["a"]
+	if stored.Status != domain.AccountCooldown || stored.CooldownUntil == nil || !stored.CooldownUntil.Equal(now.Add(time.Minute)) || stored.FailureCount != 1 {
+		t.Fatalf("older success erased concurrent cooldown: %+v", stored)
+	}
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Fatalf("account became schedulable during preserved cooldown: %v", err)
+	}
+}
+
+func TestPoolIgnoresFeedbackFromReplacedCredentials(t *testing.T) {
+	account := domain.Account{
+		ID: "a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, HealthScore: 1, CredentialFingerprint: []byte("old-fingerprint"),
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"a": {AccessToken: "old-token"}})
+	pool := NewPool(store, DefaultPolicy())
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	account.CredentialFingerprint = []byte("new-fingerprint")
+	store.SetCredentials(account.ID, domain.Credentials{AccessToken: "new-token"})
+	if err := store.UpdateAccount(context.Background(), account); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 401}); err != nil {
+		t.Fatal(err)
+	}
+	stored := store.Accounts[account.ID]
+	if stored.Status != domain.AccountActive || stored.FailureCount != 0 || stored.LastError != "" {
+		t.Fatalf("stale credential feedback changed refreshed account: %+v", stored)
+	}
+}
+
+func TestPoolIgnoresFeedbackAfterAccessTokenOnlyRotation(t *testing.T) {
+	account := domain.Account{
+		ID: "a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, HealthScore: 1,
+		CredentialFingerprint: []byte("stable-refresh-token-fingerprint"),
+		CredentialCipher:      []byte("sealed-old-access-token"),
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"a": {AccessToken: "old-token", RefreshToken: "stable-refresh-token"}})
+	pool := NewPool(store, DefaultPolicy())
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	account.CredentialCipher = []byte("sealed-new-access-token")
+	store.SetCredentials(account.ID, domain.Credentials{AccessToken: "new-token", RefreshToken: "stable-refresh-token"})
+	if err := store.UpdateAccount(context.Background(), account); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 401}); err != nil {
+		t.Fatal(err)
+	}
+	stored := store.Accounts[account.ID]
+	if stored.Status != domain.AccountActive || stored.FailureCount != 0 || stored.LastError != "" {
+		t.Fatalf("old access-token feedback changed the refreshed account: %+v", stored)
+	}
 }
 
 func TestPoolSupportsPriorityAndRoundRobinStrategies(t *testing.T) {
@@ -167,7 +281,7 @@ func TestPoolPersistsFailureStateBackoffAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	failed := store.Accounts["a"]
-	if failed.Status != domain.AccountCooldown || failed.FailureCount != 1 || failed.HealthScore >= 1 || failed.CooldownUntil == nil || !failed.CooldownUntil.Equal(now.Add(5*time.Second)) {
+	if failed.Status != domain.AccountCooldown || failed.FailureCount != 1 || failed.HealthScore >= 1 || failed.CooldownUntil == nil || !failed.CooldownUntil.Equal(now.Add(5*time.Second)) || failed.LastError != "upstream status 503" {
 		t.Fatalf("transient failure state = %+v", failed)
 	}
 	now = now.Add(6 * time.Second)
@@ -202,6 +316,22 @@ func TestPoolDisablesPermanentCredentialFailuresAndFreezesExhaustedQuota(t *test
 		}
 	}
 
+	storeWithQuota := NewMemoryStore([]domain.Account{{ID: "credential-and-quota", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}}, map[string]domain.Credentials{"credential-and-quota": {AccessToken: "token"}})
+	poolWithQuota := NewPool(storeWithQuota, DefaultPolicy())
+	poolWithQuota.now = func() time.Time { return now }
+	credentialLease, err := poolWithQuota.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialReset := now.Add(time.Hour)
+	credentialQuota := domain.QuotaSnapshot{RequestsLimit: 10, RequestsRemaining: 0, ResetAt: &credentialReset, ObservedAt: now}
+	if err := credentialLease.Release(context.Background(), Feedback{StatusCode: 401, Quota: &credentialQuota}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storeWithQuota.Accounts["credential-and-quota"]; got.Status != domain.AccountDisabled || got.CooldownUntil != nil {
+		t.Fatalf("permanent credential failure was hidden by exhausted quota: %+v", got)
+	}
+
 	reset := now.Add(time.Hour)
 	store := NewMemoryStore([]domain.Account{{ID: "quota", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}}, map[string]domain.Credentials{"quota": {AccessToken: "token"}})
 	pool := NewPool(store, DefaultPolicy())
@@ -215,6 +345,96 @@ func TestPoolDisablesPermanentCredentialFailuresAndFreezesExhaustedQuota(t *test
 	got := store.Accounts["quota"]
 	if got.Status != domain.AccountCooldown || got.CooldownUntil == nil || !got.CooldownUntil.Equal(reset) {
 		t.Fatalf("quota exhaustion state = %+v", got)
+	}
+}
+
+func TestPoolBlocksTokenQuotaAndUsesFallbackWhenResetIsMissing(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reset := now.Add(time.Hour)
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	account := domain.Account{
+		ID: "token-quota", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, HealthScore: 1,
+		Quota: domain.QuotaSnapshot{TokensLimit: 1000, TokensRemaining: 0, ResetAt: &reset, ObservedAt: now},
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"token-quota": {AccessToken: "token"}})
+	pool := NewPool(store, DefaultPolicy())
+	pool.now = func() time.Time { return now }
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Fatalf("token-exhausted account was schedulable: %v", err)
+	}
+
+	now = reset.Add(time.Second)
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quota := domain.QuotaSnapshot{TokensLimit: 1000, TokensRemaining: 0, ObservedAt: now}
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 200, Quota: &quota}); err != nil {
+		t.Fatal(err)
+	}
+	stored := store.Accounts["token-quota"]
+	want := now.Add(time.Hour)
+	if stored.Status != domain.AccountCooldown || stored.CooldownUntil == nil || !stored.CooldownUntil.Equal(want) {
+		t.Fatalf("missing-reset token quota state = %+v, want cooldown until %v", stored, want)
+	}
+}
+
+func TestPoolDoesNotRestartCooldownFromExpiredQuotaSnapshot(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reset := now.Add(time.Minute)
+	account := domain.Account{
+		ID: "expired-quota", Kind: domain.CredentialCLIOAuth, Status: domain.AccountCooldown,
+		ConcurrencyLimit: 1, HealthScore: 0.8, FailureCount: 1, CooldownUntil: &reset,
+		Quota: domain.QuotaSnapshot{RequestsLimit: 10, RequestsRemaining: 0, ResetAt: &reset, ObservedAt: now},
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"expired-quota": {AccessToken: "token"}})
+	pool := NewPool(store, DefaultPolicy())
+	pool.now = func() time.Time { return now }
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	if _, err := pool.Acquire(context.Background(), Selection{Model: model}); !errorsIs(err, ErrNoAccount) {
+		t.Fatalf("account was schedulable before quota reset: %v", err)
+	}
+
+	now = reset.Add(time.Second)
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+	stored := store.Accounts[account.ID]
+	if stored.Status != domain.AccountActive || stored.CooldownUntil != nil {
+		t.Fatalf("expired quota snapshot restarted cooldown: %+v", stored)
+	}
+	second, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatalf("account was not reusable after the expired quota reset: %v", err)
+	}
+	_ = second.Release(context.Background(), Feedback{StatusCode: 200})
+}
+
+func TestPool429UsesLaterRetryAfterThanQuotaReset(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	reset := now.Add(10 * time.Second)
+	account := domain.Account{ID: "limited", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1, HealthScore: 1}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"limited": {AccessToken: "token"}})
+	pool := NewPool(store, DefaultPolicy())
+	pool.now = func() time.Time { return now }
+	model := domain.ModelSpec{ID: "grok", CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}}
+	lease, err := pool.Acquire(context.Background(), Selection{Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quota := domain.QuotaSnapshot{RequestsLimit: 10, RequestsRemaining: 0, ResetAt: &reset, ObservedAt: now}
+	if err := lease.Release(context.Background(), Feedback{StatusCode: 429, RetryAfter: time.Minute, Quota: &quota}); err != nil {
+		t.Fatal(err)
+	}
+	stored := store.Accounts[account.ID]
+	want := now.Add(time.Minute)
+	if stored.CooldownUntil == nil || !stored.CooldownUntil.Equal(want) {
+		t.Fatalf("429 cooldown = %v, want later Retry-After %v", stored.CooldownUntil, want)
 	}
 }
 
@@ -254,7 +474,7 @@ func TestPoolReloadAppliesManualDisableAndConcurrencyImmediately(t *testing.T) {
 	_ = first.Release(context.Background(), Feedback{StatusCode: 200})
 }
 
-func TestPoolSteadySuccessAvoidsPersistenceWrites(t *testing.T) {
+func TestPoolSteadySuccessCoalescesLastUsedPersistence(t *testing.T) {
 	account := domain.Account{ID: "steady", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 8, HealthScore: 1}
 	store := &countingAccountStore{MemoryStore: NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"steady": {AccessToken: "token"}})}
 	pool := NewPool(store, DefaultPolicy())
@@ -271,8 +491,8 @@ func TestPoolSteadySuccessAvoidsPersistenceWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if store.updates != 0 {
-		t.Fatalf("steady success persisted %d redundant account updates", store.updates)
+	if store.updates != 1 {
+		t.Fatalf("steady success persisted %d account updates, want one coalesced last-used write", store.updates)
 	}
 	if notifier.Count(configevent.ScopeAccounts) != 0 {
 		t.Fatalf("steady success published %d redundant account notifications", notifier.Count(configevent.ScopeAccounts))

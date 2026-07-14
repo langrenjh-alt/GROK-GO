@@ -180,9 +180,11 @@ func TestRefreshServiceConcurrentManualRefreshReusesRotatedCredentials(t *testin
 	store := newBarrierCredentialStore(domain.Credentials{AccessToken: "old-access", RefreshToken: "old-refresh"}, 2)
 	store.setAccountState(domain.AccountExpired, nil, "previous refresh failure")
 	coordinator := newMemoryCoordinator()
+	var callbacks atomic.Int32
 	service := &RefreshService{
 		OAuth: NewOAuthService(OAuthConfig{TokenURL: server.URL, ClientID: "client"}, server.Client()),
 		Store: store, Locks: coordinator, LockTTL: time.Minute,
+		OnAccountsChanged: func(context.Context) { callbacks.Add(1) },
 	}
 
 	start := make(chan struct{})
@@ -206,8 +208,8 @@ func TestRefreshServiceConcurrentManualRefreshReusesRotatedCredentials(t *testin
 			t.Fatalf("unexpected refreshed credentials: %#v", credentials)
 		}
 	}
-	if refreshes.Load() != 1 || store.saveCount() != 1 {
-		t.Fatalf("expected one token rotation and save, got refreshes=%d saves=%d", refreshes.Load(), store.saveCount())
+	if refreshes.Load() != 1 || store.saveCount() != 1 || callbacks.Load() != 1 {
+		t.Fatalf("expected one token rotation, save, and callback; got refreshes=%d saves=%d callbacks=%d", refreshes.Load(), store.saveCount(), callbacks.Load())
 	}
 	if coordinator.compareDeleteCount() != 2 || !coordinator.allComparesMatched() {
 		t.Fatal("concurrent refresh requests did not release their owner locks")

@@ -373,6 +373,46 @@ func TestGatewayFailsOverAcrossAllCredentialKindsBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestGatewayRefreshesCLIOAuthOnceBeforeFailover(t *testing.T) {
+	models := NewStaticModelSource([]domain.ModelSpec{{
+		ID: "grok-refresh", UpstreamModel: "grok-refresh", Capability: domain.CapabilityChat,
+		CredentialKinds: []domain.CredentialKind{domain.CredentialCLIOAuth}, Enabled: true,
+	}})
+	store := accounts.NewMemoryStore(
+		[]domain.Account{{ID: "oauth", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive, ConcurrencyLimit: 1}},
+		map[string]domain.Credentials{"oauth": {AccessToken: "old-access", RefreshToken: "refresh"}},
+	)
+	pool := accounts.NewPool(store, accounts.DefaultPolicy())
+	var calls []string
+	client := upstream.ClientFunc(func(_ context.Context, request upstream.Request) (*upstream.Response, error) {
+		calls = append(calls, request.Credentials.AccessToken)
+		if request.Credentials.AccessToken == "old-access" {
+			return &upstream.Response{StatusCode: http.StatusUnauthorized}, nil
+		}
+		return &upstream.Response{StatusCode: http.StatusOK, Events: upstream.Events(
+			upstream.Event{Kind: upstream.EventTextDelta, Text: "refreshed"},
+			upstream.Event{Kind: upstream.EventDone},
+		)}, nil
+	})
+	refreshes := 0
+	handler, err := NewHandler(Config{
+		Models: models, Accounts: pool, Upstream: client, MaxAttempts: 2,
+		RefreshAccount: func(ctx context.Context, accountID string) error {
+			refreshes++
+			store.SetCredentials(accountID, domain.Credentials{AccessToken: "new-access", RefreshToken: "refresh"})
+			return pool.Reload(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-refresh","messages":[]}`)))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "refreshed") || refreshes != 1 || !slices.Equal(calls, []string{"old-access", "new-access"}) {
+		t.Fatalf("refresh retry = status:%d refreshes:%d calls:%v body:%s", response.Code, refreshes, calls, response.Body.String())
+	}
+}
+
 func TestImageAndImageEditCapabilitiesUseDistinctEndpoints(t *testing.T) {
 	image := domain.ModelSpec{Capability: domain.CapabilityImage}
 	edit := domain.ModelSpec{Capability: domain.CapabilityImageEdit}
@@ -400,5 +440,26 @@ func TestQuotaFromHeadersPreservesLimitsUnlimitedAndReset(t *testing.T) {
 	}
 	if quotaFromHeaders(make(http.Header), now) != nil {
 		t.Fatal("empty headers produced a quota snapshot")
+	}
+}
+
+func TestQuotaFromHeadersUsesResetForExhaustedDimension(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	header := make(http.Header)
+	header.Set("X-RateLimit-Limit-Requests", "100")
+	header.Set("X-RateLimit-Remaining-Requests", "0")
+	header.Set("X-RateLimit-Limit-Tokens", "1000")
+	header.Set("X-RateLimit-Remaining-Tokens", "500")
+	header.Set("X-RateLimit-Reset-Requests", "30s")
+	header.Set("X-RateLimit-Reset-Tokens", "1h")
+	quota := quotaFromHeaders(header, now)
+	if quota == nil || quota.ResetAt == nil || !quota.ResetAt.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("request-exhausted reset = %+v", quota)
+	}
+
+	header.Set("X-RateLimit-Remaining-Tokens", "0")
+	quota = quotaFromHeaders(header, now)
+	if quota == nil || quota.ResetAt == nil || !quota.ResetAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("both-dimensions-exhausted reset = %+v", quota)
 	}
 }

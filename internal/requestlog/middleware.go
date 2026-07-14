@@ -62,6 +62,7 @@ func (m Middleware) Handler(next http.Handler) http.Handler {
 			InputTokens:  completion.InputTokens,
 			OutputTokens: completion.OutputTokens,
 			CachedTokens: completion.CachedTokens,
+			UsageParsed:  completion.UsageParsed,
 			CreatedAt:    started.UTC(),
 		}
 		if statusCode >= http.StatusBadRequest {

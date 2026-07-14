@@ -266,7 +266,10 @@ func (s *RefreshService) RefreshAccount(ctx context.Context, accountID string) (
 	if err != nil {
 		return domain.Credentials{}, err
 	}
-	result, _, err := s.refreshAccount(ctx, accountID, credentials, time.Time{})
+	result, changed, err := s.refreshAccount(ctx, accountID, credentials, time.Time{})
+	if changed {
+		s.accountsChanged(ctx)
+	}
 	return result, err
 }
 

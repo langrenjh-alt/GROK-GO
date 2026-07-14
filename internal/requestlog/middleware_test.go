@@ -68,7 +68,7 @@ func TestMiddlewareRecordsCompletionUsage(t *testing.T) {
 	if sink.entry.ClientKeyID != "key-1" || sink.entry.AccountID != "account-1" || sink.entry.Model != "grok-chat" {
 		t.Fatalf("unexpected log identity: %+v", sink.entry)
 	}
-	if sink.entry.InputTokens != 9 || sink.entry.OutputTokens != 4 || sink.entry.CachedTokens != 3 {
+	if sink.entry.InputTokens != 9 || sink.entry.OutputTokens != 4 || sink.entry.CachedTokens != 3 || !sink.entry.UsageParsed {
 		t.Fatalf("unexpected log usage: %+v", sink.entry)
 	}
 }

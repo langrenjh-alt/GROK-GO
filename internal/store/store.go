@@ -122,6 +122,13 @@ func nullableString(value string) any {
 	return value
 }
 
+func nullableBytes(value []byte) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return value
+}
+
 func ensureTime(value time.Time) time.Time {
 	if value.IsZero() {
 		return time.Now().UTC()

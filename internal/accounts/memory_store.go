@@ -47,6 +47,12 @@ func (s *MemoryStore) Credentials(_ context.Context, accountID string) (domain.C
 	return value, nil
 }
 
+func (s *MemoryStore) SetCredentials(accountID string, credentials domain.Credentials) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CredentialsByAccount[accountID] = credentials
+}
+
 func (s *MemoryStore) GetAccount(_ context.Context, accountID string) (*domain.Account, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

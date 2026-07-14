@@ -12,7 +12,7 @@ test:
 build: web
 	go build -trimpath -o bin/grok-go ./cmd/grok-go
 
-release: web
+release:
 	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1
 
 clean:

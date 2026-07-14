@@ -130,6 +130,7 @@ export interface RequestLog {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+  usage_parsed?: boolean;
   error_code?: string;
   error_summary?: string;
   metadata?: unknown;

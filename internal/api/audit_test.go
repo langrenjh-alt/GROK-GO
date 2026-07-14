@@ -165,7 +165,12 @@ func TestAuditListFiltersAndRetentionCleanup(t *testing.T) {
 }
 
 func TestAuditClassificationNeverPersistsPathLikeResourceID(t *testing.T) {
-	action, resourceType, resourceID := classifyAuditMutation(http.MethodDelete, "/media/../../outside", "admin-1")
+	action, resourceType, resourceID := classifyAuditMutation(http.MethodPost, "/accounts/export", "admin-1")
+	if action != "account.export" || resourceType != "account" || resourceID != "" {
+		t.Fatalf("account export audit classification = %q %q %q", action, resourceType, resourceID)
+	}
+
+	action, resourceType, resourceID = classifyAuditMutation(http.MethodDelete, "/media/../../outside", "admin-1")
 	if action == "" || resourceType != "media" || resourceID != "" {
 		t.Fatalf("path-like target classified as %q %q %q", action, resourceType, resourceID)
 	}

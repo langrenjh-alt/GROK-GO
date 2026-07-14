@@ -46,11 +46,14 @@ type RedisCommands interface {
 	AcquireSlot(context.Context, string, int, time.Duration) (bool, error)
 	ReleaseSlot(context.Context, string) error
 	CompareDelete(context.Context, string, []byte) (bool, error)
+	CompareExpire(context.Context, string, []byte, time.Duration) (bool, error)
+	SetIfGreater(context.Context, string, int64, time.Time) (bool, error)
+	AcquireLeaseSlot(context.Context, string, string, int, time.Duration) (bool, error)
+	ReleaseLeaseSlot(context.Context, string, string) error
 }
 
-// RedisCoordinator uses owner-specific slot keys instead of a shared counter.
-// This makes lease release idempotent and prevents a stale owner from releasing
-// a slot that has already been acquired by another process.
+// RedisCoordinator uses owner-specific members in one atomic sorted set per
+// account. Release remains idempotent without a per-limit Redis round trip.
 type RedisCoordinator struct {
 	redis     RedisCommands
 	namespace string
@@ -99,16 +102,14 @@ func (c *RedisCoordinator) AcquireLease(ctx context.Context, accountID string, l
 		return CoordinationLease{}, false, fmt.Errorf("create account lease owner: %w", err)
 	}
 	owner := hex.EncodeToString(ownerBytes)
-	for slot := 0; slot < limit; slot++ {
-		acquired, err := c.redis.SetNX(ctx, c.leaseKey(accountID, slot), []byte(owner), ttl)
-		if err != nil {
-			return CoordinationLease{}, false, fmt.Errorf("acquire account lease: %w", err)
-		}
-		if acquired {
-			return CoordinationLease{AccountID: accountID, Slot: slot, Owner: owner}, true, nil
-		}
+	acquired, err := c.redis.AcquireLeaseSlot(ctx, c.leaseKey(accountID), owner, limit, ttl)
+	if err != nil {
+		return CoordinationLease{}, false, fmt.Errorf("acquire account lease: %w", err)
 	}
-	return CoordinationLease{}, false, nil
+	if !acquired {
+		return CoordinationLease{}, false, nil
+	}
+	return CoordinationLease{AccountID: accountID, Slot: 0, Owner: owner}, true, nil
 }
 
 func (c *RedisCoordinator) ReleaseLease(ctx context.Context, lease CoordinationLease) error {
@@ -118,8 +119,7 @@ func (c *RedisCoordinator) ReleaseLease(ctx context.Context, lease CoordinationL
 	if lease.AccountID == "" || lease.Slot < 0 || lease.Owner == "" {
 		return errors.New("invalid account coordination lease")
 	}
-	_, err := c.redis.CompareDelete(ctx, c.leaseKey(lease.AccountID, lease.Slot), []byte(lease.Owner))
-	if err != nil {
+	if err := c.redis.ReleaseLeaseSlot(ctx, c.leaseKey(lease.AccountID), lease.Owner); err != nil {
 		return fmt.Errorf("release account lease: %w", err)
 	}
 	return nil
@@ -173,6 +173,13 @@ func (c *RedisCoordinator) BindAffinity(ctx context.Context, model, affinity, ac
 		if len(value) == 0 {
 			return "", errors.New("bound account affinity is empty")
 		}
+		refreshed, err := c.redis.CompareExpire(ctx, key, value, ttl)
+		if err != nil {
+			return "", fmt.Errorf("refresh bound account affinity: %w", err)
+		}
+		if !refreshed {
+			continue
+		}
 		return string(value), nil
 	}
 	return "", errors.New("account affinity changed while binding")
@@ -224,8 +231,7 @@ func (c *RedisCoordinator) SetCooldown(ctx context.Context, accountID string, un
 	if ttl <= 0 {
 		return nil
 	}
-	value := []byte(strconv.FormatInt(until.UnixNano(), 10))
-	if err := c.redis.Set(ctx, c.cooldownKey(accountID), value, ttl); err != nil {
+	if _, err := c.redis.SetIfGreater(ctx, c.cooldownKey(accountID), until.UnixNano(), until); err != nil {
 		return fmt.Errorf("set account cooldown: %w", err)
 	}
 	return nil
@@ -244,8 +250,8 @@ func (c *RedisCoordinator) ClearCooldown(ctx context.Context, accountID string) 
 	return nil
 }
 
-func (c *RedisCoordinator) leaseKey(accountID string, slot int) string {
-	return fmt.Sprintf("%s:lease:%s:%d", c.namespace, digest(accountID), slot)
+func (c *RedisCoordinator) leaseKey(accountID string) string {
+	return fmt.Sprintf("%s:leases:%s", c.namespace, digest(accountID))
 }
 
 func (c *RedisCoordinator) affinityKey(model, affinity string) string {

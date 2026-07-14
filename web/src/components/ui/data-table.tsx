@@ -20,7 +20,7 @@ export function DataTable<T>({ data, columns, getRowId, ariaLabel, className }: 
     getRowId,
   });
   return (
-    <div className={cn("scrollbar w-full min-w-0 max-w-[100dvw] overflow-x-auto border-y border-border bg-surface", className)}>
+    <div className={cn("scrollbar relative w-full min-w-0 max-w-full overflow-x-auto border-y border-border bg-surface", className)}>
       <table aria-label={ariaLabel} className="w-full min-w-[760px] border-collapse text-left text-sm">
         <thead className="bg-subtle text-fg-muted">
           {table.getHeaderGroups().map((group) => (

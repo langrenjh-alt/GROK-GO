@@ -73,6 +73,43 @@ func TestCacheHitRateUsesOnlyValidInputTokens(t *testing.T) {
 	}
 }
 
+func TestCacheRequestRatesClampInvalidCounts(t *testing.T) {
+	if got := CacheRequestHitRate(2, 3); got != float64(2)*100/3 {
+		t.Fatalf("request hit rate = %v", got)
+	}
+	if got := CacheUsageCoverage(4, 5); got != 80 {
+		t.Fatalf("usage coverage = %v", got)
+	}
+	for _, value := range []float64{
+		CacheRequestHitRate(1, 0),
+		CacheRequestHitRate(-1, 10),
+		CacheUsageCoverage(20, 10),
+	} {
+		if value < 0 || value > 100 {
+			t.Fatalf("percentage escaped valid range: %v", value)
+		}
+	}
+	if got := CacheUsageCoverage(20, 10); got != 100 {
+		t.Fatalf("over-reported coverage = %v", got)
+	}
+}
+
+func TestCacheEligibleRequestRequiresSuccessfulConversation(t *testing.T) {
+	for _, endpoint := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		if !CacheEligibleRequest(endpoint, 200) {
+			t.Errorf("successful %s request was not cache eligible", endpoint)
+		}
+		if CacheEligibleRequest(endpoint, 429) {
+			t.Errorf("failed %s request was cache eligible", endpoint)
+		}
+	}
+	for _, endpoint := range []string{"/v1/images/generations", "/v1/videos", "/v1/models"} {
+		if CacheEligibleRequest(endpoint, 200) {
+			t.Errorf("non-conversational %s request was cache eligible", endpoint)
+		}
+	}
+}
+
 func TestMarshalJSONReturnsJSONText(t *testing.T) {
 	value, err := marshalJSON([]string{"grok-4.5"}, "[]")
 	if err != nil || value != `["grok-4.5"]` {

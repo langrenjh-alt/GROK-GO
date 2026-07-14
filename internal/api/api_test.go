@@ -170,6 +170,186 @@ func TestAccountImportEncryptsCredentials(t *testing.T) {
 	}
 }
 
+func TestGrok2APIImportPreservesLegacyPoolsAndItemMetadata(t *testing.T) {
+	environment := newAuthenticatedEnvironment(t)
+	response := environment.request(t, http.MethodPost, "/accounts/import", map[string]any{
+		"kind": "grok_sso",
+		"tags": []string{"batch", "shared"},
+		"ssoBasic": []map[string]any{{
+			"token": "\ufeffsso=\u200bbasic-token\u200d",
+			"tags":  []string{"auto-register", "shared"},
+			"note":  "basic@example.test",
+		}},
+		"ssoSuper": []map[string]any{{
+			"token": "sso=super-token",
+			"tags":  []string{"super-only"},
+			"note":  "Super account note",
+		}},
+		"ssoHeavy": []map[string]any{{
+			"token": "\u2060heavy-token",
+			"tags":  []string{"heavy-only"},
+			"note":  "Heavy account note",
+		}},
+	}, environment.cookie, environment.csrf)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imported":3`) {
+		t.Fatalf("legacy pool import = %d %s", response.Code, response.Body.String())
+	}
+	for _, token := range []string{"basic-token", "super-token", "heavy-token"} {
+		if strings.Contains(response.Body.String(), token) {
+			t.Fatalf("legacy pool import exposed a credential: %s", response.Body.String())
+		}
+	}
+
+	want := map[string]struct {
+		tier  string
+		token string
+		tags  string
+	}{
+		"basic@example.test": {tier: "basic", token: "basic-token", tags: "auto-register,batch,shared"},
+		"Super account note": {tier: "super", token: "super-token", tags: "batch,shared,super-only"},
+		"Heavy account note": {tier: "heavy", token: "heavy-token", tags: "batch,heavy-only,shared"},
+	}
+	if len(environment.repository.accounts) != len(want) {
+		t.Fatalf("imported account count = %d", len(environment.repository.accounts))
+	}
+	for _, account := range environment.repository.accounts {
+		expected, ok := want[account.Name]
+		if !ok {
+			t.Fatalf("legacy note was not preserved as account name: %#v", account)
+		}
+		credentials, err := environment.management.GetAccountCredentials(context.Background(), account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tags := append([]string(nil), account.Tags...)
+		sort.Strings(tags)
+		if account.Tier != expected.tier || credentials.SSO != expected.token || credentials.SSORW != expected.token || strings.Join(tags, ",") != expected.tags {
+			t.Fatalf("legacy account = tier %q token %q tags %v, want tier %q token %q tags %q", account.Tier, credentials.SSO, tags, expected.tier, expected.token, expected.tags)
+		}
+	}
+}
+
+func TestGrok2APIListExportImportPreservesPerItemPoolAndStatus(t *testing.T) {
+	environment := newAuthenticatedEnvironment(t)
+	response := environment.request(t, http.MethodPost, "/accounts/import", map[string]any{
+		"kind": "grok_sso",
+		"tokens": []map[string]any{
+			{"token": "active-super-token", "pool": "super", "status": "active", "tags": []string{"from-list"}},
+			{"token": "disabled-heavy-token", "pool": "heavy", "status": "disabled"},
+			{"token": "cooling-basic-token", "pool": "basic", "status": "cooling"},
+		},
+	}, environment.cookie, environment.csrf)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imported":3`) {
+		t.Fatalf("grok2api list export import = %d %s", response.Code, response.Body.String())
+	}
+	want := map[string]struct {
+		tier   string
+		status domain.AccountStatus
+	}{
+		"active-super-token":   {tier: "super", status: domain.AccountActive},
+		"disabled-heavy-token": {tier: "heavy", status: domain.AccountDisabled},
+		"cooling-basic-token":  {tier: "basic", status: domain.AccountCooldown},
+	}
+	for _, account := range environment.repository.accounts {
+		credentials, err := environment.management.GetAccountCredentials(context.Background(), account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, ok := want[credentials.SSO]
+		if !ok {
+			t.Fatalf("unexpected imported credential for account %#v", account)
+		}
+		if account.Tier != expected.tier || account.Status != expected.status {
+			t.Fatalf("imported %q = tier %q status %q, want tier %q status %q", credentials.SSO, account.Tier, account.Status, expected.tier, expected.status)
+		}
+		if account.Status == domain.AccountCooldown && (account.CooldownUntil == nil || !account.CooldownUntil.After(time.Now())) {
+			t.Fatalf("cooling account has no future cooldown: %#v", account)
+		}
+	}
+}
+
+func TestNormalizeImportTierSupportsGrok2APIAliases(t *testing.T) {
+	tests := map[string]string{
+		"": "basic", "auto": "basic", "basic": "basic", "ssobasic": "basic", "ssoBasic": "basic",
+		"super": "super", "ssoSuper": "super", "heavy": "heavy", "ssoHeavy": "heavy", " custom ": "custom",
+	}
+	for input, expected := range tests {
+		if actual := normalizeImportTier(input); actual != expected {
+			t.Errorf("normalizeImportTier(%q) = %q, want %q", input, actual, expected)
+		}
+	}
+}
+
+func TestGrok2APIAddNormalizesPoolAliases(t *testing.T) {
+	environment := newAuthenticatedEnvironment(t)
+	tests := []struct {
+		pool string
+		want string
+	}{
+		{pool: "auto", want: "basic"},
+		{pool: "ssobasic", want: "basic"},
+		{pool: "ssoBasic", want: "basic"},
+		{pool: "ssoSuper", want: "super"},
+		{pool: "ssoHeavy", want: "heavy"},
+	}
+	for index, test := range tests {
+		token := fmt.Sprintf("pool-alias-token-%d", index)
+		response := environment.request(t, http.MethodPost, "/tokens/add", map[string]any{
+			"kind": "grok_sso", "pool": test.pool, "tokens": []string{token},
+		}, environment.cookie, environment.csrf)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imported":1`) || strings.Contains(response.Body.String(), token) {
+			t.Fatalf("pool alias %q import = %d %s", test.pool, response.Code, response.Body.String())
+		}
+		found := false
+		for _, account := range environment.repository.accounts {
+			credentials, err := environment.management.GetAccountCredentials(context.Background(), account.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credentials.SSO == token {
+				found = true
+				if account.Tier != test.want {
+					t.Fatalf("pool alias %q stored tier %q, want %q", test.pool, account.Tier, test.want)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("pool alias %q token was not imported", test.pool)
+		}
+	}
+}
+
+func TestGrok2APIImportErrorsDoNotExposeItemTokens(t *testing.T) {
+	const sentinel = "pool-item-token-must-stay-secret"
+	_, err := parseImportData([]byte(`{"basic":[{"token":"` + sentinel + `","tags":42}]}`))
+	if err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("pool item error exposed credential content: %v", err)
+	}
+}
+
+func TestDeleteTokensAcceptsGrok2APIRawArray(t *testing.T) {
+	environment := newAuthenticatedEnvironment(t)
+	created, err := environment.management.CreateAccount(context.Background(), admin.CreateAccountInput{
+		Name: "Raw array delete", Kind: domain.CredentialGrokSSO,
+		Credentials: domain.Credentials{SSO: "delete-token", SSORW: "delete-token"}, ConcurrencyLimit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := environment.request(t, http.MethodDelete, "/tokens", []string{"\ufeffsso=\u200bdelete-token"}, environment.cookie, environment.csrf)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"deleted":1`) {
+		t.Fatalf("raw token delete = %d %s", response.Code, response.Body.String())
+	}
+	if _, err = environment.repository.GetAccount(context.Background(), created.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("raw token array did not delete account: %v", err)
+	}
+
+	bad := environment.request(t, http.MethodDelete, "/tokens", map[string]any{"tokens": []string{"unused"}, "unexpected": true}, environment.cookie, environment.csrf)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("object delete accepted unknown field: %d %s", bad.Code, bad.Body.String())
+	}
+}
+
 func TestAccountBatchUpdateEnableDisableAndSchedulingPolicy(t *testing.T) {
 	environment := newAuthenticatedEnvironment(t)
 	first, err := environment.management.CreateAccount(context.Background(), admin.CreateAccountInput{
@@ -520,6 +700,145 @@ func TestBuildOAuthRootJSONImportMapsAccountAndCredentials(t *testing.T) {
 	}
 }
 
+func TestBuildOAuthImportNormalizesCPAEndpointAndIgnoresTransportMetadata(t *testing.T) {
+	var fixture map[string]any
+	if err := json.Unmarshal(readBuildOAuthFixture(t), &fixture); err != nil {
+		t.Fatal(err)
+	}
+	fixture["base_url"] = xAIOfficialBaseURL
+	fixture["token_type"] = "bearer"
+	fixture["redirect_uri"] = "https://redirect.example.test/callback"
+	fixture["token_endpoint"] = "https://tokens.example.test/oauth/token"
+	fixture["headers"] = map[string]any{
+		"Authorization":    "Bearer file-controlled-token",
+		"Host":             "headers.example.test",
+		"X-XAI-Token-Auth": "file-controlled-client",
+		"X-Future-Flag":    1,
+	}
+	fixture["future_cpa_metadata"] = map[string]any{"nested": true}
+	data, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseImportData(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Accounts) != 1 || parsed.Accounts[0].Credentials == nil {
+		t.Fatalf("parsed account count = %d", len(parsed.Accounts))
+	}
+	credentials := *parsed.Accounts[0].Credentials
+	if credentials.BaseURL != xAICLIBaseURL || credentials.TokenType != "Bearer" || credentials.UserAgent != "" {
+		t.Fatalf("normalized metadata = base_url=%q token_type=%q user_agent=%q", credentials.BaseURL, credentials.TokenType, credentials.UserAgent)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, xAICLIBaseURL+"/responses", nil)
+	if err = (upstream.CLIOAuthAdapter{}).Apply(request, credentials); err != nil {
+		t.Fatal(err)
+	}
+	if request.Header.Get("Authorization") != "Bearer fixture-access-token" || request.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" || request.Header.Get("Host") != "" {
+		t.Fatal("file metadata influenced CLI request headers")
+	}
+}
+
+func TestBuildOAuthImportRejectsUnsafeSchemasWithoutLeakingSecrets(t *testing.T) {
+	const sentinel = "credential-value-must-not-appear"
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		message string
+	}{
+		{name: "wrong type", mutate: func(value map[string]any) { value["type"] = "codex" }, message: "OAuth import record type must be xai"},
+		{name: "API key auth kind", mutate: func(value map[string]any) { value["auth_kind"] = "apikey" }, message: "OAuth import record authentication kind must be oauth"},
+		{name: "missing access token", mutate: func(value map[string]any) { delete(value, "access_token") }, message: "OAuth import record requires both access and refresh tokens"},
+		{name: "missing refresh token", mutate: func(value map[string]any) { delete(value, "refresh_token") }, message: "OAuth import record requires both access and refresh tokens"},
+		{name: "empty refresh token", mutate: func(value map[string]any) { value["refresh_token"] = "  " }, message: "OAuth import record requires both access and refresh tokens"},
+		{name: "unsupported token type", mutate: func(value map[string]any) { value["token_type"] = "Basic" }, message: "OAuth import record token type must be Bearer"},
+		{name: "control in token type", mutate: func(value map[string]any) { value["token_type"] = "Bearer\r\nX-Test: value" }, message: "OAuth import record token type must be Bearer"},
+		{name: "HTTP endpoint", mutate: func(value map[string]any) { value["base_url"] = "http://api.x.ai/v1" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "custom origin", mutate: func(value map[string]any) { value["base_url"] = "https://upstream.example.test/v1" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "loopback origin", mutate: func(value map[string]any) { value["base_url"] = "https://127.0.0.1/v1" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "userinfo", mutate: func(value map[string]any) { value["base_url"] = "https://user@api.x.ai/v1" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "explicit port", mutate: func(value map[string]any) { value["base_url"] = "https://api.x.ai:443/v1" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "query", mutate: func(value map[string]any) { value["base_url"] = "https://api.x.ai/v1?target=" + sentinel }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "fragment", mutate: func(value map[string]any) { value["base_url"] = "https://api.x.ai/v1#" + sentinel }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "wrong path", mutate: func(value map[string]any) { value["base_url"] = "https://api.x.ai/v1/responses" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+		{name: "encoded path", mutate: func(value map[string]any) { value["base_url"] = "https://api.x.ai/%76%31" }, message: "OAuth import record base URL must use an official xAI endpoint"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var fixture map[string]any
+			if err := json.Unmarshal(readBuildOAuthFixture(t), &fixture); err != nil {
+				t.Fatal(err)
+			}
+			fixture["access_token"] = sentinel
+			fixture["refresh_token"] = sentinel
+			test.mutate(fixture)
+			data, err := json.Marshal(fixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = parseImportData(data)
+			if err == nil || err.Error() != test.message {
+				t.Fatalf("parse error = %v, want %q", err, test.message)
+			}
+			if strings.Contains(err.Error(), sentinel) {
+				t.Fatalf("parse error exposed a credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildOAuthImportAcceptsLegacyMinimalRecordAndCooldown(t *testing.T) {
+	cooldown := time.Now().UTC().Add(10 * time.Minute).Unix()
+	parsed, err := parseImportData([]byte(fmt.Sprintf(`{"access_token":"legacy-access","refresh_token":"legacy-refresh","disabled":false,"cooldown_until":%d}`, cooldown)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Accounts) != 1 || parsed.Accounts[0].Credentials == nil || parsed.Accounts[0].Status != domain.AccountCooldown || parsed.Accounts[0].CooldownUntil == nil || parsed.Accounts[0].Credentials.BaseURL != xAICLIBaseURL {
+		t.Fatalf("legacy OAuth record = %+v", parsed.Accounts)
+	}
+
+	for _, field := range []string{"type", "auth_kind"} {
+		var fixture map[string]any
+		if err := json.Unmarshal(readBuildOAuthFixture(t), &fixture); err != nil {
+			t.Fatal(err)
+		}
+		delete(fixture, field)
+		data, _ := json.Marshal(fixture)
+		if _, err := parseImportData(data); err != nil {
+			t.Fatalf("optional %s rejected: %v", field, err)
+		}
+	}
+}
+
+func TestNormalizeBuildOAuthBaseURLAcceptsOnlyOfficialEndpoints(t *testing.T) {
+	for _, value := range []string{"", xAICLIBaseURL, xAICLIBaseURL + "/", xAIOfficialBaseURL, xAIOfficialBaseURL + "/", "https://API.X.AI/v1"} {
+		if got, err := normalizeBuildOAuthBaseURL(value); err != nil || got != xAICLIBaseURL {
+			t.Errorf("normalizeBuildOAuthBaseURL(%q) = %q, %v", value, got, err)
+		}
+	}
+}
+
+func TestBuildOAuthDetectionPreservesGenericAccountShape(t *testing.T) {
+	data := []byte(`{"name":"Generic OAuth","kind":"cli_oauth","access_token":"test-access","refresh_token":"test-refresh"}`)
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		t.Fatal(err)
+	}
+	if isBuildOAuthImport(object) {
+		t.Fatal("generic account object was classified as a CPA OAuth record")
+	}
+	account, err := parseImportAccount(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Kind != domain.CredentialCLIOAuth || account.AccessToken == "" || account.RefreshToken == "" {
+		t.Fatal("generic account fields were not preserved")
+	}
+}
+
 func TestParseBuildOAuthArrayAndRedactsErrors(t *testing.T) {
 	fixture := readBuildOAuthFixture(t)
 	parsed, err := parseImportData(append(append([]byte{'['}, fixture...), ']'))
@@ -655,12 +974,23 @@ func TestMultipartImportMergesMultipleBuildOAuthFiles(t *testing.T) {
 	writer := multipart.NewWriter(&body)
 	_ = writer.WriteField("tier", "super")
 	_ = writer.WriteField("concurrency_limit", "6")
-	for _, filename := range []string{"first.json", "second.json"} {
+	for index, filename := range []string{"first.json", "second.json"} {
 		file, err := writer.CreateFormFile("files", filename)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := file.Write(fixture); err != nil {
+		content := fixture
+		if index == 1 {
+			var second map[string]any
+			if err := json.Unmarshal(fixture, &second); err != nil {
+				t.Fatal(err)
+			}
+			second["email"] = "second-account@example.test"
+			second["access_token"] = "second-fixture-access-token"
+			second["refresh_token"] = "second-fixture-refresh-token"
+			content, _ = json.Marshal(second)
+		}
+		if _, err := file.Write(content); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -684,6 +1014,19 @@ func TestMultipartImportMergesMultipleBuildOAuthFiles(t *testing.T) {
 		if account.Kind != domain.CredentialCLIOAuth || account.Tier != "super" || account.ConcurrencyLimit != 6 || account.Status != domain.AccountDisabled {
 			t.Fatalf("multi-file import metadata = %#v", account)
 		}
+	}
+}
+
+func TestAccountImportIsIdempotentAcrossExistingAndRepeatedCredentials(t *testing.T) {
+	environment := newAuthenticatedEnvironment(t)
+	payload := map[string]any{"kind": "grok_sso", "tier": "basic", "tokens": []string{"duplicate-token", "duplicate-token"}}
+	first := environment.request(t, http.MethodPost, "/accounts/import", payload, environment.cookie, environment.csrf)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"imported":1`) || !strings.Contains(first.Body.String(), `"skipped":1`) {
+		t.Fatalf("first idempotent import = %d %s", first.Code, first.Body.String())
+	}
+	second := environment.request(t, http.MethodPost, "/accounts/import", payload, environment.cookie, environment.csrf)
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"count":0`) || !strings.Contains(second.Body.String(), `"skipped":2`) || len(environment.repository.accounts) != 1 {
+		t.Fatalf("repeated idempotent import = %d %s accounts=%d", second.Code, second.Body.String(), len(environment.repository.accounts))
 	}
 }
 
@@ -840,15 +1183,18 @@ func TestClientIPRequiresExplicitProxyTrust(t *testing.T) {
 	}
 }
 
-func TestDashboardAggregatesCacheHitRateAcrossTheFullWindow(t *testing.T) {
+func TestDashboardCacheMetricsUseSuccessfulConversationalUsageOnly(t *testing.T) {
 	environment := newAuthenticatedEnvironment(t)
 	now := time.Now().UTC()
 	logs := []domain.RequestLog{
-		{RequestID: "cache-partial", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "cache-rate-limited", Endpoint: "/v1/responses", StatusCode: http.StatusTooManyRequests, DurationMS: 300, InputTokens: 300, OutputTokens: 30, CachedTokens: 180, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "missing-usage", Endpoint: "/v1/images/generations", StatusCode: http.StatusOK, DurationMS: 500, CachedTokens: 999, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "cache-over-report", Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, CachedTokens: 250, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "outside-window", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 10, InputTokens: 100, OutputTokens: 10, CachedTokens: 100, CreatedAt: now.Add(-25 * time.Hour)},
+		{RequestID: "cache-partial", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, OutputTokens: 20, CachedTokens: 40, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-rate-limited", Endpoint: "/v1/responses", StatusCode: http.StatusTooManyRequests, DurationMS: 300, InputTokens: 300, OutputTokens: 30, CachedTokens: 180, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "missing-usage", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 500, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "parsed-zero-usage", Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 80, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-over-report", Endpoint: "/v1/messages", StatusCode: http.StatusOK, DurationMS: 100, InputTokens: 100, CachedTokens: 250, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "non-cache-media", Endpoint: "/v1/images/generations", StatusCode: http.StatusOK, DurationMS: 200, InputTokens: 400, CachedTokens: 300, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "cache-miss", Endpoint: "/v1/responses", StatusCode: http.StatusOK, DurationMS: 120, InputTokens: 200, OutputTokens: 10, UsageParsed: true, CreatedAt: now.Add(-30 * time.Minute)},
+		{RequestID: "outside-window", Endpoint: "/v1/chat/completions", StatusCode: http.StatusOK, DurationMS: 10, InputTokens: 100, OutputTokens: 10, CachedTokens: 100, UsageParsed: true, CreatedAt: now.Add(-25 * time.Hour)},
 	}
 	for index := range logs {
 		if err := environment.management.CreateRequestLog(context.Background(), &logs[index]); err != nil {
@@ -862,33 +1208,47 @@ func TestDashboardAggregatesCacheHitRateAcrossTheFullWindow(t *testing.T) {
 	}
 	var envelope struct {
 		Data struct {
-			Requests            int64     `json:"requests_24h"`
-			SuccessRate         float64   `json:"success_rate"`
-			AverageLatency      int64     `json:"avg_latency_ms"`
-			Tokens              int64     `json:"tokens_24h"`
-			InputTokens         int64     `json:"input_tokens_24h"`
-			CachedTokens        int64     `json:"cached_tokens_24h"`
-			UsageSamples        int64     `json:"usage_samples_24h"`
-			CacheHitRate        float64   `json:"cache_hit_rate"`
-			HourlyRequests      []int64   `json:"hourly_requests"`
-			HourlyInputTokens   []int64   `json:"hourly_input_tokens"`
-			HourlyCachedTokens  []int64   `json:"hourly_cached_tokens"`
-			HourlyUsageSamples  []int64   `json:"hourly_usage_samples"`
-			HourlyCacheHitRates []float64 `json:"hourly_cache_hit_rate"`
+			Requests                    int64     `json:"requests_24h"`
+			SuccessRate                 float64   `json:"success_rate"`
+			AverageLatency              int64     `json:"avg_latency_ms"`
+			Tokens                      int64     `json:"tokens_24h"`
+			InputTokens                 int64     `json:"input_tokens_24h"`
+			CachedTokens                int64     `json:"cached_tokens_24h"`
+			UsageSamples                int64     `json:"usage_samples_24h"`
+			CacheSamples                int64     `json:"cache_samples_24h"`
+			CacheRequestHits            int64     `json:"cache_request_hits_24h"`
+			CacheEligibleRequests       int64     `json:"cache_eligible_requests_24h"`
+			CacheHitRate                float64   `json:"cache_hit_rate"`
+			CacheTokenReuseRate         float64   `json:"cache_token_reuse_rate"`
+			CacheRequestHitRate         float64   `json:"cache_request_hit_rate"`
+			CacheUsageCoverage          float64   `json:"cache_usage_coverage"`
+			HourlyRequests              []int64   `json:"hourly_requests"`
+			HourlyCacheEligibleRequests []int64   `json:"hourly_cache_eligible_requests"`
+			HourlyInputTokens           []int64   `json:"hourly_input_tokens"`
+			HourlyCachedTokens          []int64   `json:"hourly_cached_tokens"`
+			HourlyUsageSamples          []int64   `json:"hourly_usage_samples"`
+			HourlyCacheSamples          []int64   `json:"hourly_cache_samples"`
+			HourlyCacheRequestHits      []int64   `json:"hourly_cache_request_hits"`
+			HourlyCacheTokenReuseRates  []float64 `json:"hourly_cache_token_reuse_rate"`
+			HourlyCacheRequestHitRates  []float64 `json:"hourly_cache_request_hit_rate"`
+			HourlyCacheUsageCoverage    []float64 `json:"hourly_cache_usage_coverage"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
 		t.Fatal(err)
 	}
 	data := envelope.Data
-	if data.Requests != 4 || data.SuccessRate != 75 || data.AverageLatency != 250 || data.Tokens != 550 {
+	if data.Requests != 7 || data.SuccessRate != float64(6)*100/7 || data.AverageLatency != 200 || data.Tokens != 1160 {
 		t.Fatalf("request summary = %+v", data)
 	}
-	if data.InputTokens != 500 || data.CachedTokens != 320 || data.UsageSamples != 3 || data.CacheHitRate != 64 {
+	if data.InputTokens != 400 || data.CachedTokens != 140 || data.UsageSamples != 4 || data.CacheSamples != 3 || data.CacheRequestHits != 2 || data.CacheEligibleRequests != 5 {
 		t.Fatalf("cache summary = %+v", data)
 	}
-	if len(data.HourlyRequests) != 24 || len(data.HourlyCacheHitRates) != 24 || data.HourlyRequests[23] != 4 || data.HourlyInputTokens[23] != 500 || data.HourlyCachedTokens[23] != 320 || data.HourlyUsageSamples[23] != 3 || data.HourlyCacheHitRates[23] != 64 {
-		t.Fatalf("latest hourly cache point = requests:%v input:%v cached:%v samples:%v rates:%v", data.HourlyRequests, data.HourlyInputTokens, data.HourlyCachedTokens, data.HourlyUsageSamples, data.HourlyCacheHitRates)
+	if data.CacheHitRate != 35 || data.CacheTokenReuseRate != 35 || data.CacheRequestHitRate != float64(2)*100/3 || data.CacheUsageCoverage != 80 {
+		t.Fatalf("cache rates = %+v", data)
+	}
+	if len(data.HourlyRequests) != 24 || len(data.HourlyCacheTokenReuseRates) != 24 || data.HourlyRequests[23] != 7 || data.HourlyCacheEligibleRequests[23] != 5 || data.HourlyInputTokens[23] != 400 || data.HourlyCachedTokens[23] != 140 || data.HourlyUsageSamples[23] != 4 || data.HourlyCacheSamples[23] != 3 || data.HourlyCacheRequestHits[23] != 2 || data.HourlyCacheTokenReuseRates[23] != 35 || data.HourlyCacheRequestHitRates[23] != float64(2)*100/3 || data.HourlyCacheUsageCoverage[23] != 80 {
+		t.Fatalf("latest hourly cache point = %+v", data)
 	}
 }
 
@@ -1614,14 +1974,26 @@ func (r *memoryRepository) GetRequestLogStats(_ context.Context, from, to time.T
 			hours[hoursAgo] = hour
 		}
 		hour.Requests++
-		if value.InputTokens > 0 {
+		if store.CacheEligibleRequest(value.Endpoint, value.StatusCode) {
+			stats.CacheEligibleRequests++
+			hour.CacheEligibleRequests++
+		}
+		if store.CacheEligibleRequest(value.Endpoint, value.StatusCode) && value.UsageParsed {
+			stats.UsageSamples++
+			hour.UsageSamples++
+		}
+		if store.CacheEligibleRequest(value.Endpoint, value.StatusCode) && value.UsageParsed && value.InputTokens > 0 {
 			cached := store.NormalizedCachedTokens(value.InputTokens, value.CachedTokens)
 			stats.CacheInputTokens += value.InputTokens
 			stats.CachedTokens += cached
-			stats.UsageSamples++
+			stats.CacheSamples++
 			hour.InputTokens += value.InputTokens
 			hour.CachedTokens += cached
-			hour.UsageSamples++
+			hour.CacheSamples++
+			if cached > 0 {
+				stats.CacheRequestHits++
+				hour.CacheRequestHits++
+			}
 		}
 	}
 	for _, hour := range hours {

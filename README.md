@@ -50,8 +50,8 @@ go test ./...
 go build -trimpath -o bin/grok-go ./cmd/grok-go
 ```
 
-On Windows, `make release` or `scripts/build-release.ps1` creates the static
-`linux/amd64` artifact in `bin/`.
+On Windows, `make release` or `scripts/build-release.ps1` builds and stages the
+web console before creating the static `linux/amd64` artifact in `bin/`.
 
 ## First start
 
@@ -107,11 +107,18 @@ is cached behind a short-lived signed URL.
 
 See [API compatibility](docs/api-compatibility.md) for the supported surface.
 See [Performance baseline](docs/performance.md) for reproducible parallel
-gateway benchmarks and measurement scope.
+gateway benchmarks and measurement scope. Release changes are recorded in the
+[changelog](CHANGELOG.md).
 
-## Account import compatibility
+## Account backup compatibility
 
-The administration API includes grok2api-compatible token import routes:
+The Accounts page and administration API import native GROK-GO backups,
+sub2api Grok OAuth backups, grok2api token pools, and xAI OAuth records used by
+CLIProxyAPI (CPA). JSON, plain text, and multiple multipart files are accepted.
+Repeated imports are idempotent: a keyed credential fingerprint identifies the
+same upstream identity without storing a plaintext lookup value.
+
+The administration API also retains grok2api-compatible token import routes:
 
 ```bash
 curl https://grok.example.com/admin/api/tokens/add \
@@ -121,10 +128,26 @@ curl https://grok.example.com/admin/api/tokens/add \
   -d '{"tokens":["SSO_TOKEN"],"pool":"basic","tags":["imported"]}'
 ```
 
-JSON and text files can also be uploaded from the Accounts page. Imported
-secrets are encrypted before persistence and are never returned by list APIs.
-Management aliases use the same administrator session and CSRF protection as
-the rest of the console.
+Exports are created with `POST /admin/api/accounts/export`. Select between one
+and 500 account IDs, choose `native`, `sub2api`, `grok2api`, or `cpa`, and
+confirm the current administrator password plus the TOTP code when TOTP is
+enabled. The response is a no-store attachment. Export files contain usable
+upstream credentials and must be handled as secrets.
+
+| Format | Import | Export constraints |
+| --- | --- | --- |
+| GROK-GO native | Version 1 account backup | All supported credential kinds; preserves scheduling metadata |
+| sub2api | Grok/xAI OAuth accounts from version 1 or legacy bundles | CLI OAuth accounts with access and refresh tokens |
+| grok2api | `basic`, `super`, `heavy`, `auto`, and `sso*` token pools, or a `/tokens` list export | Grok SSO accounts grouped into basic/super/heavy pools |
+| CPA / CLIProxyAPI | xAI OAuth JSON, including legacy minimal records | CLI OAuth; one account is JSON, multiple accounts are a ZIP |
+
+Imported secrets are encrypted before persistence and are never returned by
+list APIs. OAuth imports accept only complete Bearer credentials and normalize
+the upstream URL to the supported xAI CLI endpoint; imported endpoint and
+header overrides are not trusted. Management aliases use the same
+administrator session and CSRF protection as the rest of the console. See
+[API compatibility](docs/api-compatibility.md#account-import-and-export) for
+the request schema and round-trip details.
 
 The embedded model catalog contains the supported Grok text and media presets,
 their credential routes, account-tier requirements, and best-tier preference.
@@ -140,6 +163,24 @@ customizations; custom models can be added and removed from the console.
   quota, and credential-state changes use the same propagation path.
   Reconnecting instances reconcile from PostgreSQL before accepting subsequent
   notifications.
+- Account eligibility observes both request and token quota. Exhausted accounts
+  remain cooling until the provider reset time, or a credential-kind fallback
+  window when the provider omits a reset timestamp. Selection scores the lower
+  remaining request/token ratio, and an older concurrent success cannot erase
+  a newer rate-limit cooldown. A pre-commit CLI OAuth 401 triggers one
+  coordinated credential refresh before normal failover.
+- CLI OAuth credentials are refreshed before expiry under a distributed Redis
+  lock. Expiry is visible in the account list, and administrators can also
+  request an immediate refresh for one account.
+- Distributed account concurrency uses an atomic Redis sorted-set lease per
+  account. Replayed acquisition by the same owner is idempotent and mixed lease
+  TTLs retain the latest live expiry. Active cache affinity refreshes its TTL
+  while the binding is still owned, so long conversations retain a stable
+  account without stale releases.
+- Dashboard cache reporting separates cached-token reuse, request-level cache
+  hits, and parsed-usage coverage. Only successful Chat Completions, Responses,
+  and Messages requests enter cache denominators; failed and media requests do
+  not distort the rates.
 - Metadata-only request logs use a bounded asynchronous queue. Administrator
   mutations are recorded separately with actor, action, resource, status,
   request ID, and source address; bodies, cookies, and credentials are omitted.

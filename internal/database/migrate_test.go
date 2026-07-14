@@ -56,6 +56,50 @@ func TestGrokModelCatalogMigration(t *testing.T) {
 	}
 }
 
+func TestAccountCredentialFingerprintMigration(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fingerprintSQL string
+	for _, migration := range migrations {
+		if migration.Version == "007_account_credential_fingerprints.sql" {
+			fingerprintSQL = migration.SQL
+			break
+		}
+	}
+	if fingerprintSQL == "" {
+		t.Fatal("account credential fingerprint migration is missing")
+	}
+	for _, fragment := range []string{
+		"ADD COLUMN IF NOT EXISTS credential_fingerprint BYTEA",
+		"CREATE UNIQUE INDEX IF NOT EXISTS accounts_credential_fingerprint_unique",
+		"ON accounts (kind, credential_fingerprint)",
+		"WHERE credential_fingerprint IS NOT NULL",
+	} {
+		if !strings.Contains(fingerprintSQL, fragment) {
+			t.Fatalf("credential fingerprint migration does not contain %q", fragment)
+		}
+	}
+}
+
+func TestAccountErrorRedactionMigration(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var redactionSQL string
+	for _, migration := range migrations {
+		if migration.Version == "009_redact_account_errors.sql" {
+			redactionSQL = migration.SQL
+			break
+		}
+	}
+	if redactionSQL == "" || !strings.Contains(redactionSQL, "redacted upstream error") || !strings.Contains(redactionSQL, "CHAR_LENGTH(last_error) > 256") {
+		t.Fatalf("account error redaction migration is incomplete: %q", redactionSQL)
+	}
+}
+
 func TestSplitSQLStatementsHonorsQuotedAndDollarQuotedSemicolons(t *testing.T) {
 	input := `
 		CREATE TABLE test (value text DEFAULT ';');

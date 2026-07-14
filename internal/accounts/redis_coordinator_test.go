@@ -78,6 +78,9 @@ func TestRedisCoordinatorAffinityAndCooldownTTL(t *testing.T) {
 	if err := coordinator.SetCooldown(ctx, "account-a", until); err != nil {
 		t.Fatal(err)
 	}
+	if err := coordinator.SetCooldown(ctx, "account-a", now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	got, cooling, err := coordinator.CooldownUntil(ctx, "account-a")
 	if err != nil || !cooling || !got.Equal(until) {
 		t.Fatalf("cooldown mismatch: got=%v cooling=%v err=%v", got, cooling, err)
@@ -135,6 +138,37 @@ func TestPoolCoordinatorEnforcesCrossInstanceLeaseAndCooldown(t *testing.T) {
 	}
 }
 
+func TestPoolReloadDoesNotClearCoordinatedCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	redis := newFakeRedis(func() time.Time { return now })
+	coordinator := NewRedisCoordinator(redis)
+	coordinator.now = func() time.Time { return now }
+	account := domain.Account{
+		ID: "account-a", Kind: domain.CredentialCLIOAuth, Status: domain.AccountActive,
+		ConcurrencyLimit: 1, CredentialCipher: []byte("sealed-credential"),
+	}
+	store := NewMemoryStore([]domain.Account{account}, map[string]domain.Credentials{"account-a": {AccessToken: "token"}})
+	pool := NewPoolWithCoordinator(store, DefaultPolicy(), coordinator)
+	pool.now = func() time.Time { return now }
+	until := now.Add(time.Minute)
+	coordinationID := account.ID
+	if err := coordinator.SetCooldown(context.Background(), coordinationID, until); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, cooling, err := coordinator.CooldownUntil(context.Background(), coordinationID); err != nil || !cooling || !got.Equal(until) {
+		t.Fatalf("reload cleared coordinated cooldown: got=%v cooling=%v err=%v", got, cooling, err)
+	}
+	if err := pool.ClearCooldown(context.Background(), account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, cooling, err := coordinator.CooldownUntil(context.Background(), coordinationID); err != nil || cooling {
+		t.Fatalf("explicit activation did not clear cooldown: cooling=%v err=%v", cooling, err)
+	}
+}
+
 func TestPoolCoordinatorKeepsCrossInstanceAffinityUntilTTL(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	redis := newFakeRedis(func() time.Time { return now })
@@ -176,6 +210,24 @@ func TestPoolCoordinatorKeepsCrossInstanceAffinityUntilTTL(t *testing.T) {
 		t.Fatalf("second pool ignored coordinated affinity, got %s", leaseB.Account.ID)
 	}
 	if err := leaseB.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(45 * time.Second)
+	refreshing, err := poolB.Acquire(context.Background(), selection)
+	if err != nil || refreshing.Account.ID != "account-a" {
+		t.Fatalf("active affinity was not refreshed: lease=%+v err=%v", refreshing, err)
+	}
+	if err := refreshing.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(30 * time.Second)
+	stillBound, err := poolB.Acquire(context.Background(), selection)
+	if err != nil || stillBound.Account.ID != "account-a" {
+		t.Fatalf("refreshed affinity expired from its original deadline: lease=%+v err=%v", stillBound, err)
+	}
+	if err := stillBound.Release(context.Background(), Feedback{StatusCode: 200}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -226,11 +278,12 @@ type fakeRedis struct {
 	mu       sync.Mutex
 	now      func() time.Time
 	values   map[string]fakeRedisEntry
+	leases   map[string]map[string]time.Time
 	setNXErr error
 }
 
 func newFakeRedis(now func() time.Time) *fakeRedis {
-	return &fakeRedis{now: now, values: make(map[string]fakeRedisEntry)}
+	return &fakeRedis{now: now, values: make(map[string]fakeRedisEntry), leases: make(map[string]map[string]time.Time)}
 }
 
 func (r *fakeRedis) Get(_ context.Context, key string) ([]byte, error) {
@@ -315,6 +368,68 @@ func (r *fakeRedis) CompareDelete(_ context.Context, key string, expected []byte
 	}
 	delete(r.values, key)
 	return true, nil
+}
+
+func (r *fakeRedis) CompareExpire(_ context.Context, key string, expected []byte, ttl time.Duration) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.getLocked(key)
+	if !ok || !bytes.Equal(entry.value, expected) {
+		return false, nil
+	}
+	entry.expiresAt = r.now().Add(ttl)
+	r.values[key] = entry
+	return true, nil
+}
+
+func (r *fakeRedis) SetIfGreater(_ context.Context, key string, value int64, expiresAt time.Time) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry, ok := r.getLocked(key); ok {
+		current, err := strconv.ParseInt(string(entry.value), 10, 64)
+		if err == nil && current >= value {
+			return false, nil
+		}
+	}
+	r.values[key] = fakeRedisEntry{value: []byte(strconv.FormatInt(value, 10)), expiresAt: expiresAt}
+	return true, nil
+}
+
+func (r *fakeRedis) AcquireLeaseSlot(_ context.Context, key, owner string, limit int, ttl time.Duration) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.setNXErr != nil {
+		return false, r.setNXErr
+	}
+	owners := r.leases[key]
+	if owners == nil {
+		owners = make(map[string]time.Time)
+		r.leases[key] = owners
+	}
+	for candidate, expiresAt := range owners {
+		if !expiresAt.After(r.now()) {
+			delete(owners, candidate)
+		}
+	}
+	if _, exists := owners[owner]; exists {
+		owners[owner] = r.now().Add(ttl)
+		return true, nil
+	}
+	if len(owners) >= limit {
+		return false, nil
+	}
+	owners[owner] = r.now().Add(ttl)
+	return true, nil
+}
+
+func (r *fakeRedis) ReleaseLeaseSlot(_ context.Context, key, owner string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.leases[key], owner)
+	if len(r.leases[key]) == 0 {
+		delete(r.leases, key)
+	}
+	return nil
 }
 
 func (r *fakeRedis) getLocked(key string) (fakeRedisEntry, bool) {

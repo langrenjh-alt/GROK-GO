@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -86,11 +87,12 @@ type Feedback struct {
 }
 
 type runtimeState struct {
-	account      domain.Account
-	inflight     int
-	health       float64
-	failures     int
-	cooldownTill time.Time
+	account           domain.Account
+	inflight          int
+	health            float64
+	failures          int
+	cooldownTill      time.Time
+	lastUsedPersisted time.Time
 }
 
 type affinityEntry struct {
@@ -197,7 +199,6 @@ func (p *Pool) Reload(ctx context.Context) error {
 	}
 	p.mu.Lock()
 	seen := make(map[string]struct{}, len(items))
-	clearCooldown := make([]string, 0, len(items))
 	for i := range items {
 		item := items[i]
 		if item.HealthScore <= 0 {
@@ -212,8 +213,8 @@ func (p *Pool) Reload(ctx context.Context) error {
 		state.account = item
 		state.health = item.HealthScore
 		state.failures = item.FailureCount
-		if item.Status == domain.AccountActive && item.CooldownUntil == nil {
-			clearCooldown = append(clearCooldown, item.ID)
+		if item.LastUsedAt != nil && item.LastUsedAt.After(state.lastUsedPersisted) {
+			state.lastUsedPersisted = *item.LastUsedAt
 		}
 		if item.CooldownUntil != nil && item.CooldownUntil.After(state.cooldownTill) {
 			state.cooldownTill = *item.CooldownUntil
@@ -234,14 +235,18 @@ func (p *Pool) Reload(ctx context.Context) error {
 	}
 	p.loaded = true
 	p.mu.Unlock()
+	return nil
+}
+
+// ClearCooldown removes coordinated cooldown state after a caller has
+// explicitly persisted an active account transition. Periodic reloads must
+// not clear these keys because their database snapshot can be older than a
+// concurrent failure observed by another process.
+func (p *Pool) ClearCooldown(ctx context.Context, accountID string) error {
 	if p.coordinator == nil {
 		return nil
 	}
-	var result error
-	for _, accountID := range clearCooldown {
-		result = errors.Join(result, p.coordinator.ClearCooldown(ctx, accountID))
-	}
-	return result
+	return p.coordinator.ClearCooldown(ctx, accountID)
 }
 
 func (p *Pool) Acquire(ctx context.Context, selection Selection) (*Lease, error) {
@@ -479,10 +484,8 @@ func (p *Pool) eligibleLocked(state *runtimeState, model domain.ModelSpec, now t
 	if model.MinimumTier != "" && tierRank(account.Tier) < tierRank(model.MinimumTier) {
 		return false
 	}
-	if account.Quota.RequestsLimit > 0 && account.Quota.RequestsRemaining <= 0 {
-		if account.Quota.ResetAt == nil || account.Quota.ResetAt.After(now) {
-			return false
-		}
+	if fallback := p.policy.RateLimitCooldown[account.Kind]; quotaUnavailableUntil(account.Quota, now, fallback).After(now) {
+		return false
 	}
 	return true
 }
@@ -490,8 +493,11 @@ func (p *Pool) eligibleLocked(state *runtimeState, model domain.ModelSpec, now t
 func score(state *runtimeState, now time.Time) float64 {
 	quotaScore := 1.0
 	quota := state.account.Quota
-	if quota.RequestsLimit > 0 {
-		quotaScore = math.Max(0, math.Min(1, float64(quota.RequestsRemaining)/float64(quota.RequestsLimit)))
+	if !quota.RequestsUnlimited && quota.RequestsLimit > 0 {
+		quotaScore = math.Min(quotaScore, quotaFraction(quota.RequestsRemaining, quota.RequestsLimit))
+	}
+	if !quota.TokensUnlimited && quota.TokensLimit > 0 {
+		quotaScore = math.Min(quotaScore, quotaFraction(quota.TokensRemaining, quota.TokensLimit))
 	}
 	recentPenalty := 0.0
 	if state.account.LastUsedAt != nil {
@@ -503,11 +509,15 @@ func score(state *runtimeState, now time.Time) float64 {
 	return float64(state.account.Priority)*1000 + state.health*100 + quotaScore*25 - float64(state.inflight)*20 - float64(min(state.failures, 10))*4 - recentPenalty
 }
 
+func quotaFraction(remaining, limit int64) float64 {
+	return math.Max(0, math.Min(1, float64(remaining)/float64(limit)))
+}
+
 func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) error {
 	now := p.now()
 	var accountToUpdate *domain.Account
 	var cooldownUntil time.Time
-	clearCooldown := false
+	publishChange := false
 	p.mu.Lock()
 	state := p.states[lease.Account.ID]
 	if state != nil {
@@ -515,25 +525,79 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 			state.inflight--
 		}
 		account := state.account
+		if !bytes.Equal(account.CredentialCipher, lease.Account.CredentialCipher) ||
+			!bytes.Equal(account.CredentialFingerprint, lease.Account.CredentialFingerprint) {
+			p.mu.Unlock()
+			var result error
+			if p.coordinator != nil && lease.coordination != nil {
+				result = p.coordinator.ReleaseLease(ctx, *lease.coordination)
+			}
+			return result
+		}
 		persist := false
+		if state.lastUsedPersisted.IsZero() || now.Sub(state.lastUsedPersisted) >= 30*time.Second {
+			state.lastUsedPersisted = now
+			persist = true
+		}
 		if feedback.Quota != nil {
 			account.Quota = *feedback.Quota
 			persist = true
+			publishChange = true
 		}
-		manuallyDisabled := account.Status == domain.AccountDisabled && lease.Account.Status != domain.AccountDisabled
-		quotaReset, quotaExhausted := exhaustedQuotaReset(account.Quota, now)
+		terminalStateChanged := account.Status != lease.Account.Status && isTerminalAccountStatus(account.Status)
+		concurrentCooldown := state.cooldownTill.After(now) && account.Status == domain.AccountCooldown
+		quotaReset, quotaExhausted := exhaustedQuotaReset(account.Quota, account.Kind, p.policy, now, feedback.Quota != nil)
 		switch {
-		case manuallyDisabled:
-			clearCooldown = true
+		case terminalStateChanged:
+		case feedback.StatusCode == 429:
+			persist = true
+			publishChange = true
+			state.health = math.Max(.05, state.health*.45)
+			state.failures++
+			cooldown := feedback.RetryAfter
+			if cooldown <= 0 {
+				cooldown = p.policy.RateLimitCooldown[account.Kind]
+			}
+			if cooldown <= 0 {
+				cooldown = 15 * time.Minute
+			}
+			candidate := now.Add(cooldown)
+			if quotaExhausted && quotaReset.After(candidate) {
+				candidate = quotaReset
+			}
+			if state.cooldownTill.After(candidate) {
+				candidate = state.cooldownTill
+			}
+			state.cooldownTill = candidate
+			cooldownUntil = candidate
+			account.Status = domain.AccountCooldown
+			account.CooldownUntil = ptr(candidate)
+			account.LastError = feedbackMessage(feedback)
+		case isPermanentCredentialFailure(feedback.StatusCode):
+			persist = true
+			publishChange = true
+			state.health = math.Max(.05, state.health*.25)
+			state.failures++
+			state.cooldownTill = time.Time{}
+			account.Status = domain.AccountDisabled
+			account.CooldownUntil = nil
+			account.LastError = feedbackMessage(feedback)
 		case quotaExhausted:
 			persist = true
+			publishChange = true
 			state.health = math.Max(.05, state.health*.9)
 			state.failures++
+			if state.cooldownTill.After(quotaReset) {
+				quotaReset = state.cooldownTill
+			}
 			state.cooldownTill = quotaReset
 			cooldownUntil = quotaReset
 			account.Status = domain.AccountCooldown
 			account.CooldownUntil = ptr(quotaReset)
 			account.LastError = "upstream quota exhausted"
+		case feedback.StatusCode >= 200 && feedback.StatusCode < 400 && feedback.Err == nil && concurrentCooldown:
+			// A request acquired before a concurrent failure must not erase its
+			// unexpired cooldown when that older request later succeeds.
 		case feedback.StatusCode >= 200 && feedback.StatusCode < 400 && feedback.Err == nil:
 			recovering := state.health < 1 || state.failures != 0 || account.Status != domain.AccountActive || account.CooldownUntil != nil || account.LastError != ""
 			state.health = math.Min(1, state.health+0.12)
@@ -544,37 +608,13 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 			account.LastError = ""
 			if recovering {
 				persist = true
-				clearCooldown = true
+				publishChange = true
 			}
-		case isPermanentCredentialFailure(feedback.StatusCode):
-			persist = true
-			state.health = math.Max(.05, state.health*.25)
-			state.failures++
-			state.cooldownTill = time.Time{}
-			account.Status = domain.AccountDisabled
-			account.CooldownUntil = nil
-			account.LastError = feedbackMessage(feedback)
-			clearCooldown = true
-		case feedback.StatusCode == 429:
-			persist = true
-			state.health = math.Max(.05, state.health*.45)
-			state.failures++
-			cooldown := feedback.RetryAfter
-			if cooldown <= 0 {
-				cooldown = p.policy.RateLimitCooldown[account.Kind]
-			}
-			if cooldown <= 0 {
-				cooldown = 15 * time.Minute
-			}
-			state.cooldownTill = now.Add(cooldown)
-			cooldownUntil = state.cooldownTill
-			account.Status = domain.AccountCooldown
-			account.CooldownUntil = ptr(state.cooldownTill)
-			account.LastError = feedbackMessage(feedback)
 		case feedback.StatusCode == 499:
 			// Client cancellation is not an upstream health failure.
 		case feedback.Err != nil || feedback.StatusCode >= 500:
 			persist = true
+			publishChange = true
 			state.health = math.Max(.05, state.health*.75)
 			state.failures++
 			cooldown := transientBackoff(p.policy, state.failures)
@@ -588,8 +628,6 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 		account.FailureCount = state.failures
 		state.account = account
 		if persist {
-			account.UpdatedAt = now
-			state.account.UpdatedAt = now
 			accountToUpdate = ptr(account)
 		}
 	}
@@ -599,9 +637,12 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 	if accountToUpdate != nil {
 		if err := p.store.UpdateAccount(ctx, *accountToUpdate); err != nil {
 			result = errors.Join(result, err)
-		} else if err := p.Reload(ctx); err != nil {
-			result = errors.Join(result, err)
-		} else {
+		} else if publishChange {
+			if err := p.Reload(ctx); err != nil {
+				result = errors.Join(result, err)
+			}
+		}
+		if publishChange && result == nil {
 			p.mu.Lock()
 			notifier := p.notifier
 			p.mu.Unlock()
@@ -613,8 +654,6 @@ func (p *Pool) release(ctx context.Context, lease *Lease, feedback Feedback) err
 	if p.coordinator != nil && lease.coordination != nil {
 		if !cooldownUntil.IsZero() {
 			result = errors.Join(result, p.coordinator.SetCooldown(ctx, lease.Account.ID, cooldownUntil))
-		} else if clearCooldown {
-			result = errors.Join(result, p.coordinator.ClearCooldown(ctx, lease.Account.ID))
 		}
 		result = errors.Join(result, p.coordinator.ReleaseLease(ctx, *lease.coordination))
 	}
@@ -625,12 +664,61 @@ func isPermanentCredentialFailure(status int) bool {
 	return status == 401 || status == 403 || status == 423
 }
 
-func exhaustedQuotaReset(quota domain.QuotaSnapshot, now time.Time) (time.Time, bool) {
-	exhausted := quota.RequestsLimit > 0 && quota.RequestsRemaining <= 0 || quota.TokensLimit > 0 && quota.TokensRemaining <= 0
-	if !exhausted || quota.ResetAt == nil || !quota.ResetAt.After(now) {
+func isTerminalAccountStatus(status domain.AccountStatus) bool {
+	switch status {
+	case domain.AccountDisabled, domain.AccountExpired, domain.AccountError:
+		return true
+	default:
+		return false
+	}
+}
+
+func exhaustedQuotaReset(quota domain.QuotaSnapshot, kind domain.CredentialKind, policy Policy, now time.Time, freshlyObserved bool) (time.Time, bool) {
+	if !quotaExhausted(quota) {
 		return time.Time{}, false
 	}
-	return *quota.ResetAt, true
+	fallback := policy.RateLimitCooldown[kind]
+	if fallback <= 0 {
+		fallback = 15 * time.Minute
+	}
+	until := quotaUnavailableUntil(quota, now, fallback)
+	if !until.After(now) {
+		if !freshlyObserved {
+			return time.Time{}, false
+		}
+		until = now.Add(fallback)
+	}
+	return until, true
+}
+
+func quotaExhausted(quota domain.QuotaSnapshot) bool {
+	requests := !quota.RequestsUnlimited && quota.RequestsLimit > 0 && quota.RequestsRemaining <= 0
+	tokens := !quota.TokensUnlimited && quota.TokensLimit > 0 && quota.TokensRemaining <= 0
+	return requests || tokens
+}
+
+func quotaUnavailableUntil(quota domain.QuotaSnapshot, now time.Time, fallback time.Duration) time.Time {
+	if !quotaExhausted(quota) {
+		return time.Time{}
+	}
+	if quota.ResetAt != nil {
+		if quota.ResetAt.After(now) {
+			return *quota.ResetAt
+		}
+		return time.Time{}
+	}
+	if fallback > 0 && !quota.ObservedAt.IsZero() {
+		until := quota.ObservedAt.Add(fallback)
+		if until.After(now) {
+			return until
+		}
+	}
+	return time.Time{}
+}
+
+// QuotaUnavailableUntil reports the active block window for a quota snapshot.
+func QuotaUnavailableUntil(quota domain.QuotaSnapshot, kind domain.CredentialKind, now time.Time) time.Time {
+	return quotaUnavailableUntil(quota, now, DefaultPolicy().RateLimitCooldown[kind])
 }
 
 func transientBackoff(policy Policy, failures int) time.Duration {
@@ -676,11 +764,17 @@ func tierRank(tier string) int {
 }
 
 func feedbackMessage(feedback Feedback) string {
-	if feedback.Err != nil {
-		return feedback.Err.Error()
-	}
 	if feedback.StatusCode > 0 {
 		return "upstream status " + itoa(feedback.StatusCode)
+	}
+	if errors.Is(feedback.Err, context.DeadlineExceeded) {
+		return "upstream request timed out"
+	}
+	if errors.Is(feedback.Err, context.Canceled) {
+		return "upstream request was canceled"
+	}
+	if feedback.Err != nil {
+		return "upstream transport failed"
 	}
 	return ""
 }

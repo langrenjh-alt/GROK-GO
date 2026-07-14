@@ -33,6 +33,32 @@ bounded LRU, so high-concurrency traffic reuses transports without allowing an
 unbounded number of proxy pools. Account batch updates are validated up front
 and committed in one PostgreSQL transaction before the in-memory pool reloads.
 
+Distributed concurrency uses one Redis sorted set per account. An atomic Lua
+operation removes expired owners and reserves a member only when the configured
+limit has capacity. Replaying the same owner is idempotent even at capacity,
+and the key expiry follows the latest live member so a short lease cannot
+truncate a longer one. The random owner value prevents one request from
+releasing another request's lease. Account affinity uses compare-and-expire so
+active bindings extend their lifetime only while the value remains unchanged.
+
+Health feedback is persisted through a field-level runtime update. It changes
+only status, health, failure, quota, cooldown, last-used, and error fields; it
+does not overwrite an administrator's scheduling edits. A manually disabled
+account remains disabled, and stale feedback is ignored after the sealed
+credential ciphertext changes, including access-token rotations that preserve
+the stable import fingerprint. Last-used-only writes are rate-limited and do
+not publish configuration notifications.
+
+Both request and token quota participate in account eligibility. When the
+provider reports exhaustion without a usable reset timestamp, the pool applies
+the configured credential-kind cooldown instead of immediately rescheduling
+the account. Permanent credential failures disable the account; rate limits
+and transient failures enter bounded cooldown states. Candidate scoring uses
+the lower bounded request/token remaining ratio. A success from a request that
+started before a concurrent failure cannot clear the newer unexpired cooldown;
+terminal disabled, expired, and error states also require an administrative or
+credential-refresh transition rather than stale runtime feedback.
+
 ## Prompt cache identity
 
 The gateway derives one stable, tenant-isolated UUID-shaped identity from the
@@ -41,6 +67,47 @@ cache key, request metadata, Anthropic ephemeral cache blocks, or the stable
 system/tool/first-user prefix. It is used both as the upstream prompt cache
 identity and as the account-affinity key. Hashing the downstream credential
 into the identity namespace prevents cache affinity from crossing tenants.
+The Redis affinity TTL is refreshed on a successful compare against the current
+binding. GROK-GO does not cache text response bodies locally; cache-rate values
+come from upstream cached-input token usage.
+
+Request logs record whether usage was actually parsed instead of inferring that
+fact from a zero token count. Cache aggregates include only successful Chat
+Completions, Responses, and Messages requests. Token reuse and request-hit
+denominators additionally require parsed usage and positive input tokens;
+usage coverage exposes how many otherwise eligible responses supplied parsed
+usage. Migration `008_request_log_usage_parsed.sql` marks historical rows with
+non-zero token data as parsed and leaves ambiguous zero-token rows unknown.
+
+Account health errors are stored as bounded summaries. Values containing URLs,
+authorization material, or token field names are replaced with a generic
+redacted marker. Migration `009_redact_account_errors.sql` applies the same
+rule to historical account rows created before this behavior existed.
+
+## Account backup identity
+
+Migration `007_account_credential_fingerprints.sql` adds a nullable credential
+fingerprint and a unique partial index scoped by credential kind. The
+fingerprint is a keyed HMAC derived from the stable upstream identity: the
+refresh token when present (otherwise the access token) for OAuth accounts, and
+the SSO token for SSO accounts. This makes imports idempotent while keeping
+plaintext credentials out of the index. OAuth access-token rotation preserves
+identity when the refresh token is unchanged.
+
+Existing rows remain readable because the column is nullable. During import,
+legacy rows without a stored fingerprint are compared through decrypted
+credentials, and new writes populate the fingerprint. The fingerprint is only
+the stable duplicate-detection identity. Runtime feedback separately carries
+the observed AES-GCM ciphertext as a credential revision, so a request using an
+older access token cannot overwrite state after a concurrent credential
+replacement even when the refresh token and import fingerprint are unchanged.
+
+Migration 007 intentionally does not backfill legacy rows: an older database
+may already contain duplicate credentials, and backfilling them inside the
+migration would prevent startup. Operators should consolidate accounts with the
+same credential kind and upstream credential before upgrading. A later account
+edit or OAuth refresh writes the fingerprint, at which point the unique index
+surfaces any remaining duplicate.
 
 ## Media pipelines
 

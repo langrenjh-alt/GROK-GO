@@ -2,7 +2,7 @@
 
 import { useDeferredValue, useMemo, useRef, useState } from "react";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Activity, CircleCheck, CircleX, ExternalLink, FileJson, KeyRound, Pencil, Plus, Power, PowerOff, RefreshCw, Upload, UsersRound, X } from "lucide-react";
+import { Activity, CircleAlert, CircleCheck, CircleX, Download, ExternalLink, FileJson, KeyRound, LockKeyhole, Pencil, Plus, Power, PowerOff, RefreshCw, ShieldCheck, Upload, UsersRound, X } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
 import { Button, IconButton } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
@@ -11,7 +11,7 @@ import { Input, Select, Textarea } from "@/components/ui/form";
 import { EmptyState, ErrorState, LoadingState } from "@/components/ui/feedback";
 import { useToast } from "@/components/ui/toast";
 import { useI18n } from "@/components/i18n-provider";
-import { apiFetch, jsonBody } from "@/lib/api";
+import { apiFetch, apiFetchResponse, jsonBody } from "@/lib/api";
 import { formatRelative } from "@/lib/format";
 import type { Account, AccountProbeBatchResult, AccountProbeResult, AccountQuotaMetricSummary, AccountQuotaSummary, AccountSchedulingStrategy, AccountStatus, CredentialKind, ListResponse, ProxyRecord } from "@/lib/types";
 import { normalizeList } from "@/lib/types";
@@ -31,6 +31,15 @@ interface ImportResult {
   failed: number;
   errors?: string[];
 }
+
+interface AdminPrincipal {
+  id: string;
+  email: string;
+  totp_enabled: boolean;
+}
+
+type MeResponse = AdminPrincipal | { principal: AdminPrincipal };
+type AccountExportFormat = "native" | "sub2api" | "grok2api" | "cpa";
 
 const emptyQuotaSummary: AccountQuotaSummary = {
   total_accounts: 0,
@@ -52,9 +61,13 @@ export function AccountsView() {
   const quotaResource = useResource<AccountQuotaSummary>("/accounts/quota-summary", emptyQuotaSummary);
   const policyResource = useResource<{ strategy: AccountSchedulingStrategy }>("/accounts/policy", { strategy: "affinity" });
   const proxyResource = useResource<ProxyRecord[] | ListResponse<ProxyRecord>>("/proxies", []);
+  const adminResource = useResource<MeResponse>("/auth/me", { id: "", email: "", totp_enabled: false });
   const [open, setOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [importFiles, setImportFiles] = useState<File[]>([]);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
   const [oauthOpen, setOAuthOpen] = useState(false);
   const [editAccount, setEditAccount] = useState<Account | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
@@ -76,6 +89,7 @@ export function AccountsView() {
   const total = accountList.total ?? accountItems.length;
   usePageClamp(page, pageSize, total, setPage);
   const allVisibleSelected = rows.length > 0 && rows.every((account) => selected.has(account.id));
+  const adminPrincipal = "principal" in adminResource.data ? adminResource.data.principal : adminResource.data;
   const proxyOptions = useMemo(() => [
     { value: "", label: locale === "zh" ? "直连（不使用代理）" : "Direct (no proxy)" },
     ...(normalizeList(proxyResource.data).items ?? []).map((proxy) => ({ value: proxy.id, label: proxy.name })),
@@ -288,6 +302,48 @@ export function AccountsView() {
     finally { setSaving(false); }
   }
 
+  function openExportDialog() {
+    if (selected.size === 0) {
+      toast(locale === "zh" ? "请先选择要导出的账号。" : "Select the accounts to export first.", "error");
+      return;
+    }
+    setExportError("");
+    setExportOpen(true);
+  }
+
+  async function exportAccounts(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const ids = [...selected];
+    if (ids.length === 0) {
+      setExportError(locale === "zh" ? "请先选择要导出的账号。" : "Select the accounts to export first.");
+      return;
+    }
+    setExporting(true);
+    setExportError("");
+    const form = new FormData(event.currentTarget);
+    const payload: { format: AccountExportFormat; ids: string[]; current_password: string; totp_code?: string } = {
+      format: form.get("format") as AccountExportFormat,
+      ids,
+      current_password: String(form.get("current_password") ?? ""),
+    };
+    if (adminPrincipal.totp_enabled) payload.totp_code = String(form.get("totp_code") ?? "").trim();
+    try {
+      const response = await apiFetchResponse("/accounts/export", {
+        method: "POST",
+        headers: { Accept: "application/octet-stream" },
+        ...jsonBody(payload),
+      });
+      const blob = await response.blob();
+      downloadAttachment(blob, attachmentFilename(response.headers.get("content-disposition")));
+      setExportOpen(false);
+      toast(locale === "zh" ? `已导出 ${ids.length} 个账号` : `Exported ${ids.length} accounts`);
+    } catch (reason) {
+      setExportError(reason instanceof Error ? reason.message : t("common.requestFailed"));
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function refreshOAuth(id: string) {
     setRefreshingID(id);
     try {
@@ -315,7 +371,13 @@ export function AccountsView() {
 
   return (
     <ContentFrame>
-      <PageHeader title={t("account.title")} description={t("account.description")} actions={<><IconButton label={t("common.refresh")} variant="tertiary" onClick={() => void reloadAccounts()} loading={resource.loading || quotaResource.loading}><RefreshCw className="size-4" /></IconButton><Button variant="secondary" size="small" onClick={() => { setFormError(""); setImportFiles([]); setImportOpen(true); }}><Upload className="size-3.5" />{locale === "zh" ? "批量导入" : "Import"}</Button><Button variant="secondary" size="small" onClick={() => { setFormError(""); setOAuthOpen(true); }}><KeyRound className="size-3.5" />OAuth</Button><Button size="small" onClick={() => { setFormError(""); setOpen(true); }}><Plus className="size-3.5" />{locale === "zh" ? "添加账号" : "Add Account"}</Button></>} />
+      <PageHeader title={t("account.title")} description={t("account.description")} actions={<>
+        <IconButton label={t("common.refresh")} variant="tertiary" onClick={() => void reloadAccounts()} loading={resource.loading || quotaResource.loading}><RefreshCw className="size-4" /></IconButton>
+        <Button variant="secondary" size="small" onClick={openExportDialog}><Download className="size-3.5" />{locale === "zh" ? "导出账号" : "Export"}</Button>
+        <Button variant="secondary" size="small" onClick={() => { setFormError(""); setImportFiles([]); setImportOpen(true); }}><Upload className="size-3.5" />{locale === "zh" ? "批量导入" : "Import"}</Button>
+        <Button variant="secondary" size="small" onClick={() => { setFormError(""); setOAuthOpen(true); }}><KeyRound className="size-3.5" />OAuth</Button>
+        <Button size="small" onClick={() => { setFormError(""); setOpen(true); }}><Plus className="size-3.5" />{locale === "zh" ? "添加账号" : "Add Account"}</Button>
+      </>} />
       <QuotaSummaryBand summary={quotaResource.data} locale={locale} />
       <Toolbar search={search} onSearch={(value) => { setSearch(value); setPage(1); }} placeholder={locale === "zh" ? "搜索名称、邮箱或标签" : "Search name, email, or tag"} filter={filter} onFilter={(value) => { setFilter(value); setPage(1); }} filterOptions={[{ value: "all", label: locale === "zh" ? "全部状态" : "All statuses" }, { value: "active", label: "Active" }, { value: "cooldown", label: "Cooldown" }, { value: "expired", label: "Expired" }, { value: "disabled", label: "Disabled" }, { value: "error", label: "Error" }]} filters={<div className="w-full sm:w-44"><Select aria-label={locale === "zh" ? "账号调度策略" : "Account scheduling strategy"} value={policyResource.data.strategy} disabled={savingPolicy} onChange={(event) => void updatePolicy(event.target.value as AccountSchedulingStrategy)} options={[{ value: "affinity", label: locale === "zh" ? "策略：会话亲和" : "Strategy: Affinity" }, { value: "priority", label: locale === "zh" ? "策略：优先级" : "Strategy: Priority" }, { value: "round_robin", label: locale === "zh" ? "策略：轮询" : "Strategy: Round robin" }]} /></div>} trailing={<><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} loading={batchProbing} onClick={() => void probeSelected()}><Activity className="size-3.5" />{locale === "zh" ? `批量探测 (${selected.size})` : `Probe selected (${selected.size})`}</Button><Button className="w-full sm:w-auto" size="small" variant="secondary" disabled={selected.size === 0 || batchProbing} onClick={() => { setFormError(""); setBatchOpen(true); }}><UsersRound className="size-3.5" />{locale === "zh" ? `批量编辑 (${selected.size})` : `Edit selected (${selected.size})`}</Button></>} />
       {resource.loading && !accountItems.length ? <LoadingState label={t("common.loading")} /> : resource.error ? <ErrorState title={t("common.requestFailed")} description={resource.error.message} onRetry={() => void reloadAccounts()} /> : rows.length ? <DataTable ariaLabel={t("account.title")} data={rows} columns={columns} getRowId={(row) => row.id} /> : <EmptyState title={locale === "zh" ? "没有匹配的账号" : "No matching accounts"} description={locale === "zh" ? "添加上游凭据，或调整当前筛选条件。" : "Add an upstream credential or adjust the current filters."} action={<Button size="small" onClick={() => setOpen(true)}><Plus className="size-3.5" />{locale === "zh" ? "添加账号" : "Add Account"}</Button>} />}
@@ -342,6 +404,28 @@ export function AccountsView() {
 
       <Dialog open={importOpen} onOpenChange={(next) => { setImportOpen(next); if (!next) setImportFiles([]); }}><DialogContent title={locale === "zh" ? "批量导入账号" : "Import Accounts"} description={locale === "zh" ? "支持 TXT、JSON、xAI Build OAuth 以及 grok2api 账号池格式。" : "Accepts TXT, JSON, xAI Build OAuth, and grok2api pool exports."}>
         <form onSubmit={importAccounts}><div className="grid gap-4 px-5 py-5"><ImportFilePicker files={importFiles} locale={locale} onChange={setImportFiles} /><Textarea name="tokens" label={locale === "zh" ? "凭据文本" : "Credential Text"} description={locale === "zh" ? "每行一个凭据；文件和文本可同时提交。" : "One credential per line; file and text can be submitted together."} rows={5} /><div className="grid gap-4 sm:grid-cols-2"><Select name="kind" defaultValue="grok_sso" label={locale === "zh" ? "凭据类型" : "Credential Type"} options={[{ value: "grok_sso", label: "Grok SSO" }, { value: "console_sso", label: "Console SSO" }, { value: "cli_oauth", label: "CLI OAuth Token" }]} /><Select name="tier" defaultValue="basic" label={locale === "zh" ? "账号等级" : "Tier"} options={[{ value: "basic", label: "Basic" }, { value: "super", label: "Super" }, { value: "heavy", label: "Heavy" }]} /></div><Input name="tags" label={locale === "zh" ? "标签" : "Tags"} placeholder="imported, production" />{formError ? <p role="alert" className="text-copy-13 text-danger">{formError}</p> : null}</div><FormActions><DialogClose asChild><Button type="button" variant="secondary">{t("common.cancel")}</Button></DialogClose><Button type="submit" loading={saving}><Upload className="size-3.5" />{locale === "zh" ? "开始导入" : "Import"}</Button></FormActions></form>
+      </DialogContent></Dialog>
+
+      <Dialog open={exportOpen} onOpenChange={(next) => { setExportOpen(next); if (!next) setExportError(""); }}><DialogContent title={locale === "zh" ? "导出账号" : "Export Accounts"} description={locale === "zh" ? `导出已选择的 ${selected.size} 个账号。` : `Export ${selected.size} selected accounts.`}>
+        <form onSubmit={exportAccounts}>
+          <div className="grid gap-4 px-5 py-5">
+            <Select
+              name="format"
+              defaultValue="native"
+              label={locale === "zh" ? "导出格式" : "Export Format"}
+              description={locale === "zh" ? "原生格式支持全部账号；sub2api 与 CPA 仅支持 CLI OAuth；grok2api 仅支持 SSO。" : "Native supports every account type; sub2api and CPA require CLI OAuth; grok2api requires SSO."}
+              options={[{ value: "native", label: "GROK-GO Native" }, { value: "sub2api", label: "sub2api" }, { value: "grok2api", label: "grok2api" }, { value: "cpa", label: "CPA" }]}
+            />
+            <Input name="current_password" type="password" label={locale === "zh" ? "当前密码" : "Current Password"} autoComplete="current-password" prefix={<LockKeyhole className="size-4" />} required />
+            {adminPrincipal.totp_enabled ? <Input name="totp_code" label={locale === "zh" ? "双重验证码" : "Two-Factor Code"} inputMode="numeric" pattern="[0-9]{6}" maxLength={6} autoComplete="one-time-code" prefix={<ShieldCheck className="size-4" />} required /> : null}
+            <div role="note" className="flex items-start gap-3 rounded-[6px] border border-amber-soft bg-amber-soft px-3 py-2.5 text-copy-13 text-fg">
+              <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-amber" />
+              <div><p className="font-medium">{locale === "zh" ? "敏感凭据" : "Sensitive credentials"}</p><p className="mt-0.5 text-fg-muted">{locale === "zh" ? "导出文件包含可用的上游凭据，请妥善保存并限制访问。" : "The export contains usable upstream credentials. Store it securely and restrict access."}</p></div>
+            </div>
+            {exportError ? <p role="alert" className="text-copy-13 text-danger">{exportError}</p> : null}
+          </div>
+          <FormActions><DialogClose asChild><Button type="button" variant="secondary">{t("common.cancel")}</Button></DialogClose><Button type="submit" loading={exporting}><Download className="size-3.5" />{locale === "zh" ? "确认并导出" : "Confirm Export"}</Button></FormActions>
+        </form>
       </DialogContent></Dialog>
 
       <Dialog open={oauthOpen} onOpenChange={(next) => { setOAuthOpen(next); if (!next) setOAuthSession(null); }}><DialogContent title={locale === "zh" ? "添加 CLI OAuth 账号" : "Add CLI OAuth Account"} description={locale === "zh" ? "在 xAI 完成授权后粘贴回调 URL 或授权码。" : "Complete xAI authorization, then paste the callback URL or code."}>
@@ -464,4 +548,42 @@ function BatchField({ checkboxName, label, children }: { checkboxName: string; l
 
 function splitCommaList(value: FormDataEntryValue | null) {
   return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function attachmentFilename(disposition: string | null) {
+  const fallback = "grok-go-accounts.json";
+  if (!disposition) return fallback;
+  const extended = disposition.match(/filename\*\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+  if (extended) {
+    const encoded = (extended[1] ?? extended[2] ?? "").trim().replace(/^UTF-8'[^']*'/i, "");
+    try {
+      return sanitizeFilename(decodeURIComponent(encoded), fallback);
+    } catch {
+      // Try the legacy filename parameter below.
+    }
+  }
+  const regular = disposition.match(/filename\s*=\s*(?:"((?:\\.|[^"])*)"|([^;]+))/i);
+  const value = (regular?.[1] ?? regular?.[2] ?? "").trim().replace(/\\(["\\])/g, "$1");
+  return sanitizeFilename(value, fallback);
+}
+
+function sanitizeFilename(value: string, fallback: string) {
+  const invalid = '<>:"/\\|?*';
+  const sanitized = Array.from(value, (character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127 || invalid.includes(character) ? "_" : character;
+  }).join("").trim();
+  return sanitized && sanitized !== "." && sanitized !== ".." ? sanitized : fallback;
+}
+
+function downloadAttachment(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }

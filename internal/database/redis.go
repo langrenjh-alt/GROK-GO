@@ -135,6 +135,94 @@ return 0`
 	return deleted == 1, nil
 }
 
+// CompareExpire refreshes a value's TTL only while ownership is unchanged.
+func (r *Redis) CompareExpire(ctx context.Context, key string, expected []byte, ttl time.Duration) (bool, error) {
+	if r == nil || r.client == nil {
+		return false, ErrRedisDisabled
+	}
+	const script = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0`
+	refreshed, err := r.client.Eval(ctx, script, []string{r.Key(key)}, expected, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, fmt.Errorf("Redis compare-expire: %w", err)
+	}
+	return refreshed == 1, nil
+}
+
+// SetIfGreater stores a numeric deadline only when it advances the current
+// value, and expires the key at that same deadline.
+func (r *Redis) SetIfGreater(ctx context.Context, key string, value int64, expiresAt time.Time) (bool, error) {
+	if r == nil || r.client == nil {
+		return false, ErrRedisDisabled
+	}
+	const script = `
+local candidate = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]))
+if current and current >= candidate then return 0 end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('PEXPIREAT', KEYS[1], ARGV[2])
+return 1`
+	updated, err := r.client.Eval(ctx, script, []string{r.Key(key)}, value, expiresAt.UnixMilli()).Int64()
+	if err != nil {
+		return false, fmt.Errorf("Redis set-if-greater: %w", err)
+	}
+	return updated == 1, nil
+}
+
+// AcquireLeaseSlot atomically removes expired owners and reserves one slot in
+// an owner-keyed sorted set. Its cost is constant with respect to the limit.
+func (r *Redis) AcquireLeaseSlot(ctx context.Context, key, owner string, limit int, ttl time.Duration) (bool, error) {
+	if r == nil || r.client == nil {
+		return false, ErrRedisDisabled
+	}
+	if limit <= 0 || ttl <= 0 || strings.TrimSpace(owner) == "" {
+		return false, errors.New("Redis lease arguments are invalid")
+	}
+	const script = `
+local tm = redis.call('TIME')
+local now = tonumber(tm[1]) * 1000 + math.floor(tonumber(tm[2]) / 1000)
+local ttl = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  redis.call('ZADD', KEYS[1], now + ttl, ARGV[1])
+  local latest = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
+  redis.call('PEXPIREAT', KEYS[1], math.ceil(tonumber(latest[2])))
+  return 1
+end
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+redis.call('ZADD', KEYS[1], now + ttl, ARGV[1])
+local latest = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
+redis.call('PEXPIREAT', KEYS[1], math.ceil(tonumber(latest[2])))
+return 1`
+	acquired, err := r.client.Eval(ctx, script, []string{r.Key(key)}, owner, limit, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, fmt.Errorf("Redis acquire owner lease: %w", err)
+	}
+	return acquired == 1, nil
+}
+
+func (r *Redis) ReleaseLeaseSlot(ctx context.Context, key, owner string) error {
+	if r == nil || r.client == nil {
+		return ErrRedisDisabled
+	}
+	const script = `
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+local latest = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
+if #latest == 0 then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('PEXPIREAT', KEYS[1], math.ceil(tonumber(latest[2])))
+end
+return removed`
+	if err := r.client.Eval(ctx, script, []string{r.Key(key)}, owner).Err(); err != nil {
+		return fmt.Errorf("Redis release owner lease: %w", err)
+	}
+	return nil
+}
+
 func (r *Redis) Delete(ctx context.Context, keys ...string) error {
 	prefixed := make([]string, len(keys))
 	for i, key := range keys {

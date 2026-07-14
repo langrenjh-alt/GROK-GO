@@ -13,8 +13,9 @@ import (
 )
 
 type AccountStoreAdapter struct {
-	Repository store.AccountRepository
-	Management *admin.ManagementService
+	Repository         store.AccountRepository
+	Management         *admin.ManagementService
+	OnAccountActivated func(context.Context, string)
 }
 
 func (a AccountStoreAdapter) ListAccounts(ctx context.Context) ([]domain.Account, error) {
@@ -46,6 +47,11 @@ func (a AccountStoreAdapter) UpdateAccount(ctx context.Context, account domain.A
 	if a.Repository == nil {
 		return errors.New("account repository is not configured")
 	}
+	if runtimeRepository, ok := a.Repository.(interface {
+		UpdateAccountRuntime(context.Context, *domain.Account) error
+	}); ok {
+		return runtimeRepository.UpdateAccountRuntime(ctx, &account)
+	}
 	return a.Repository.UpdateAccount(ctx, &account)
 }
 
@@ -59,6 +65,9 @@ func (a AccountStoreAdapter) SaveOAuthRefresh(ctx context.Context, id string, up
 	_, err := a.Management.UpdateAccount(ctx, id, admin.UpdateAccountInput{
 		Credentials: update.Credentials, Status: &status, CooldownUntil: &cooldown, LastError: &lastError,
 	})
+	if err == nil && update.Status == domain.AccountActive && update.CooldownUntil == nil && a.OnAccountActivated != nil {
+		a.OnAccountActivated(ctx, id)
+	}
 	return err
 }
 

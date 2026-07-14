@@ -107,7 +107,7 @@ func classifyAuditMutation(method, path, principalID string) (action, resourceTy
 	}
 	reserved := map[string]bool{
 		"batch": true, "batch-delete": true, "cleanup": true, "import": true, "policy": true,
-		"probe": true, "quota-summary": true, "build-oauth": true, "add": true,
+		"probe": true, "quota-summary": true, "build-oauth": true, "add": true, "export": true,
 	}
 	operation := ""
 	if len(segments) > 1 {

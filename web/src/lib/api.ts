@@ -15,7 +15,7 @@ export class ApiError extends Error {
 
 type ApiEnvelope<T> = { data?: T; error?: { code?: string; message?: string }; message?: string };
 
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+async function apiRequest(path: string, init?: RequestInit): Promise<Response> {
   const method = (init?.method ?? "GET").toUpperCase();
   const headers = new Headers(init?.headers);
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
@@ -27,23 +27,43 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     const csrfToken = readCookie(CSRF_COOKIE);
     if (csrfToken) headers.set(CSRF_HEADER, csrfToken);
   }
-  const response = await fetch(`${API_BASE}${path}`, {
+  return fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: "same-origin",
     headers,
   });
+}
+
+async function throwIfApiError(response: Response): Promise<void> {
+  if (response.ok) return;
+  const contentType = response.headers.get("content-type") ?? "";
+  let envelope: ApiEnvelope<unknown> | undefined;
+  if (contentType.includes("application/json")) {
+    try {
+      envelope = (await response.json()) as ApiEnvelope<unknown>;
+    } catch {
+      // Fall through to the status-based message for malformed error bodies.
+    }
+  }
+  throw new ApiError(
+    envelope?.error?.message ?? envelope?.message ?? `Request failed (${response.status})`,
+    response.status,
+    envelope?.error?.code,
+  );
+}
+
+export async function apiFetchResponse(path: string, init?: RequestInit): Promise<Response> {
+  const response = await apiRequest(path, init);
+  await throwIfApiError(response);
+  return response;
+}
+
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetchResponse(path, init);
   const contentType = response.headers.get("content-type") ?? "";
   const payload = contentType.includes("application/json")
     ? ((await response.json()) as ApiEnvelope<T> | T)
     : undefined;
-  if (!response.ok) {
-    const envelope = payload as ApiEnvelope<T> | undefined;
-    throw new ApiError(
-      envelope?.error?.message ?? envelope?.message ?? `Request failed (${response.status})`,
-      response.status,
-      envelope?.error?.code,
-    );
-  }
   if (payload && typeof payload === "object" && "data" in payload) {
     return (payload as ApiEnvelope<T>).data as T;
   }

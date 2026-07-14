@@ -11,7 +11,7 @@ import (
 
 const requestLogColumns = `
 	id, request_id, client_key_id, account_id, model, endpoint, status_code,
-	duration_ms, input_tokens, output_tokens, cached_tokens, error_code,
+	duration_ms, input_tokens, output_tokens, cached_tokens, usage_parsed, error_code,
 	error_summary, metadata, created_at`
 
 type RequestLogFilter struct {
@@ -30,23 +30,29 @@ type RequestLogFilter struct {
 }
 
 type RequestLogHourStats struct {
-	HoursAgo     int
-	Requests     int64
-	InputTokens  int64
-	CachedTokens int64
-	UsageSamples int64
+	HoursAgo              int
+	Requests              int64
+	CacheEligibleRequests int64
+	InputTokens           int64
+	CachedTokens          int64
+	UsageSamples          int64
+	CacheSamples          int64
+	CacheRequestHits      int64
 }
 
 type RequestLogStats struct {
-	Requests         int64
-	Successes        int64
-	DurationMS       int64
-	InputTokens      int64
-	OutputTokens     int64
-	CacheInputTokens int64
-	CachedTokens     int64
-	UsageSamples     int64
-	Hourly           []RequestLogHourStats
+	Requests              int64
+	Successes             int64
+	DurationMS            int64
+	InputTokens           int64
+	OutputTokens          int64
+	CacheEligibleRequests int64
+	CacheInputTokens      int64
+	CachedTokens          int64
+	UsageSamples          int64
+	CacheSamples          int64
+	CacheRequestHits      int64
+	Hourly                []RequestLogHourStats
 }
 
 func (p *Postgres) CreateRequestLog(ctx context.Context, log *domain.RequestLog) error {
@@ -67,12 +73,12 @@ func (p *Postgres) CreateRequestLog(ctx context.Context, log *domain.RequestLog)
 		WITH inserted_log AS (
 			INSERT INTO request_logs (
 				id, request_id, client_key_id, account_id, model, endpoint, status_code,
-				duration_ms, input_tokens, output_tokens, cached_tokens, error_code,
-				error_summary, metadata, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15)
+				duration_ms, input_tokens, output_tokens, cached_tokens, usage_parsed,
+				error_code, error_summary, metadata, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)
 			RETURNING client_key_id, input_tokens, output_tokens, cached_tokens
 		), buckets (bucket_start, bucket_kind) AS (
-			VALUES ($16::timestamptz, 'minute'), ($17::timestamptz, 'day'), ($18::timestamptz, 'month')
+			VALUES ($17::timestamptz, 'minute'), ($18::timestamptz, 'day'), ($19::timestamptz, 'month')
 		)
 		INSERT INTO usage_buckets (
 			client_key_id, bucket_start, bucket_kind, requests,
@@ -90,7 +96,7 @@ func (p *Postgres) CreateRequestLog(ctx context.Context, log *domain.RequestLog)
 			updated_at = now()`,
 		id, log.RequestID, nullableString(log.ClientKeyID), nullableString(log.AccountID),
 		log.Model, log.Endpoint, log.StatusCode, log.DurationMS, log.InputTokens,
-		log.OutputTokens, log.CachedTokens, log.ErrorCode, log.ErrorSummary, string(metadata), createdAt,
+		log.OutputTokens, log.CachedTokens, log.UsageParsed, log.ErrorCode, log.ErrorSummary, string(metadata), createdAt,
 		minuteStart, dayStart, monthStart,
 	)
 	if err != nil {
@@ -200,32 +206,53 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 	}
 	stats := &RequestLogStats{}
 	err := p.db.QueryRow(ctx, `
+		WITH cache_rows AS (
+			SELECT status_code, duration_ms, input_tokens, output_tokens, usage_parsed,
+				status_code >= 200 AND status_code < 400
+				AND endpoint IN ('/v1/chat/completions', '/v1/responses', '/v1/messages') AS cache_eligible,
+				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens
+			FROM request_logs
+			WHERE created_at >= $1 AND created_at < $2
+		)
 		SELECT
 			COUNT(*),
 			COUNT(*) FILTER (WHERE status_code >= 200 AND status_code < 400),
 			COALESCE(SUM(duration_ms), 0),
 			COALESCE(SUM(input_tokens), 0),
 			COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(input_tokens) FILTER (WHERE input_tokens > 0), 0),
-			COALESCE(SUM(LEAST(GREATEST(cached_tokens, 0), input_tokens)) FILTER (WHERE input_tokens > 0), 0),
-			COUNT(*) FILTER (WHERE input_tokens > 0)
-		FROM request_logs
-		WHERE created_at >= $1 AND created_at < $2`, from, to).Scan(
+			COUNT(*) FILTER (WHERE cache_eligible),
+			COALESCE(SUM(input_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
+			COALESCE(SUM(normalized_cached_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0)
+		FROM cache_rows`, from, to).Scan(
 		&stats.Requests, &stats.Successes, &stats.DurationMS, &stats.InputTokens,
-		&stats.OutputTokens, &stats.CacheInputTokens, &stats.CachedTokens, &stats.UsageSamples,
+		&stats.OutputTokens, &stats.CacheEligibleRequests, &stats.CacheInputTokens,
+		&stats.CachedTokens, &stats.UsageSamples, &stats.CacheSamples, &stats.CacheRequestHits,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate request logs: %w", err)
 	}
 	rows, err := p.db.Query(ctx, `
+		WITH cache_rows AS (
+			SELECT created_at, input_tokens, usage_parsed,
+				status_code >= 200 AND status_code < 400
+				AND endpoint IN ('/v1/chat/completions', '/v1/responses', '/v1/messages') AS cache_eligible,
+				LEAST(GREATEST(cached_tokens, 0), GREATEST(input_tokens, 0)) AS normalized_cached_tokens
+			FROM request_logs
+			WHERE created_at >= $1 AND created_at < $2
+		)
 		SELECT
 			FLOOR(EXTRACT(EPOCH FROM ($2::timestamptz - created_at)) / 3600)::integer AS hours_ago,
 			COUNT(*),
-			COALESCE(SUM(input_tokens) FILTER (WHERE input_tokens > 0), 0),
-			COALESCE(SUM(LEAST(GREATEST(cached_tokens, 0), input_tokens)) FILTER (WHERE input_tokens > 0), 0),
-			COUNT(*) FILTER (WHERE input_tokens > 0)
-		FROM request_logs
-		WHERE created_at >= $1 AND created_at < $2
+			COUNT(*) FILTER (WHERE cache_eligible),
+			COALESCE(SUM(input_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
+			COALESCE(SUM(normalized_cached_tokens) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0), 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0),
+			COUNT(*) FILTER (WHERE cache_eligible AND usage_parsed AND input_tokens > 0 AND normalized_cached_tokens > 0)
+		FROM cache_rows
 		GROUP BY 1
 		ORDER BY 1`, from, to)
 	if err != nil {
@@ -235,7 +262,9 @@ func (p *Postgres) GetRequestLogStats(ctx context.Context, from, to time.Time) (
 	stats.Hourly = make([]RequestLogHourStats, 0, 24)
 	for rows.Next() {
 		var hour RequestLogHourStats
-		if err := rows.Scan(&hour.HoursAgo, &hour.Requests, &hour.InputTokens, &hour.CachedTokens, &hour.UsageSamples); err != nil {
+		if err := rows.Scan(&hour.HoursAgo, &hour.Requests, &hour.CacheEligibleRequests,
+			&hour.InputTokens, &hour.CachedTokens, &hour.UsageSamples,
+			&hour.CacheSamples, &hour.CacheRequestHits); err != nil {
 			return nil, fmt.Errorf("scan hourly request log stats: %w", err)
 		}
 		stats.Hourly = append(stats.Hourly, hour)
@@ -252,6 +281,36 @@ func CacheHitRate(cachedTokens, inputTokens int64) float64 {
 	}
 	cachedTokens = NormalizedCachedTokens(inputTokens, cachedTokens)
 	return float64(cachedTokens) * 100 / float64(inputTokens)
+}
+
+func CacheRequestHitRate(hits, samples int64) float64 {
+	return percentage(hits, samples)
+}
+
+func CacheUsageCoverage(usageSamples, eligibleRequests int64) float64 {
+	return percentage(usageSamples, eligibleRequests)
+}
+
+func percentage(numerator, denominator int64) float64 {
+	if numerator <= 0 || denominator <= 0 {
+		return 0
+	}
+	if numerator > denominator {
+		numerator = denominator
+	}
+	return float64(numerator) * 100 / float64(denominator)
+}
+
+func CacheEligibleRequest(endpoint string, statusCode int) bool {
+	if statusCode < 200 || statusCode >= 400 {
+		return false
+	}
+	switch endpoint {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages":
+		return true
+	default:
+		return false
+	}
 }
 
 func NormalizedCachedTokens(inputTokens, cachedTokens int64) int64 {
@@ -275,10 +334,10 @@ func (p *Postgres) UpdateRequestLog(ctx context.Context, log *domain.RequestLog)
 	tag, err := p.db.Exec(ctx, `
 		UPDATE request_logs SET status_code = $2, duration_ms = $3,
 			input_tokens = $4, output_tokens = $5, cached_tokens = $6,
-			error_code = $7, error_summary = $8, metadata = $9::jsonb
+			usage_parsed = $7, error_code = $8, error_summary = $9, metadata = $10::jsonb
 		WHERE id = $1`,
 		log.ID, log.StatusCode, log.DurationMS, log.InputTokens, log.OutputTokens,
-		log.CachedTokens, log.ErrorCode, log.ErrorSummary, string(metadata),
+		log.CachedTokens, log.UsageParsed, log.ErrorCode, log.ErrorSummary, string(metadata),
 	)
 	if err != nil {
 		return translateError(err)
@@ -313,7 +372,7 @@ func scanRequestLog(row rowScanner) (*domain.RequestLog, error) {
 	var clientKeyID, accountID *string
 	err := row.Scan(&log.ID, &log.RequestID, &clientKeyID, &accountID, &log.Model,
 		&log.Endpoint, &log.StatusCode, &log.DurationMS, &log.InputTokens,
-		&log.OutputTokens, &log.CachedTokens, &log.ErrorCode, &log.ErrorSummary,
+		&log.OutputTokens, &log.CachedTokens, &log.UsageParsed, &log.ErrorCode, &log.ErrorSummary,
 		&log.Metadata, &log.CreatedAt)
 	if err != nil {
 		return nil, translateError(err)

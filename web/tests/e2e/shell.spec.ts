@@ -36,8 +36,38 @@ test("account import, OAuth, and debugger controls are available", async ({ page
 test("mobile navigation opens as a dialog", async ({ page, isMobile }) => {
   test.skip(!isMobile, "mobile project only");
   await page.route("**/admin/api/auth/me", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { id: "admin-1", email: "admin@example.com" } }) }));
-  await page.route("**/admin/api/accounts", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: [] }) }));
+  const account = {
+    id: "account-1",
+    name: "Mobile account",
+    email: "mobile@example.com",
+    kind: "cli_oauth",
+    tier: "basic",
+    status: "active",
+    priority: 100,
+    concurrency_limit: 4,
+    health_score: 1,
+    failure_count: 0,
+    quota: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  await page.route("**/admin/api/accounts**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/accounts/quota-summary")) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { total_accounts: 1, available_accounts: 1, requests: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 }, tokens: { state: "unknown", limit: null, used: null, remaining: null, usage_percent: null, known_accounts: 0, unknown_accounts: 1, unlimited_accounts: 0, window_count: 0 } } }) });
+    }
+    if (path.endsWith("/accounts/policy")) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { strategy: "affinity" } }) });
+    }
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { items: [account], total: 1 } }) });
+  });
+  await page.route("**/admin/api/proxies**", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { items: [], total: 0 } }) }));
   await page.goto("/accounts/");
+  const table = page.locator("table");
+  await expect(table).toBeVisible();
+  const tableScroller = table.locator("..");
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth === document.documentElement.clientWidth)).toBe(true);
+  expect(await tableScroller.evaluate((element) => element.scrollWidth)).toBeGreaterThan(await tableScroller.evaluate((element) => element.clientWidth));
   await page.getByRole("button", { name: /打开导航|Open menu/ }).click();
   await expect(page.getByRole("dialog", { name: "Navigation" })).toBeVisible();
 });

@@ -115,7 +115,7 @@ func Run(ctx context.Context) error {
 		}
 	}
 
-	accountAdapter := AccountStoreAdapter{Repository: repository, Management: management}
+	accountAdapter := &AccountStoreAdapter{Repository: repository, Management: management}
 	accountPolicy := accounts.DefaultPolicy()
 	if value, ok := persistedSettings["account_scheduling_strategy"].(string); ok && strings.TrimSpace(value) != "" {
 		if strategy, parseErr := accounts.ParseStrategy(value); parseErr == nil {
@@ -125,6 +125,11 @@ func Run(ctx context.Context) error {
 		}
 	}
 	accountPool := accounts.NewPoolWithCoordinator(accountAdapter, accountPolicy, accounts.NewRedisCoordinator(redis))
+	accountAdapter.OnAccountActivated = func(activationCtx context.Context, accountID string) {
+		if clearErr := accountPool.ClearCooldown(activationCtx, accountID); clearErr != nil {
+			logger.Warn("clear coordinated cooldown after account activation", "account_id", accountID, "error", clearErr)
+		}
+	}
 	if err := accountPool.Reload(ctx); err != nil {
 		return fmt.Errorf("load upstream accounts: %w", err)
 	}
@@ -195,12 +200,16 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("configure account probe: %w", err)
 	}
 	rawGateway := gateway.New(gateway.Config{
-		Models:            modelSource,
-		Accounts:          accountPool,
-		Upstream:          upstreamClient,
-		Videos:            videoStore,
-		Media:             remoteMedia,
-		ProxyURL:          management.GetProxyURL,
+		Models:   modelSource,
+		Accounts: accountPool,
+		Upstream: upstreamClient,
+		Videos:   videoStore,
+		Media:    remoteMedia,
+		ProxyURL: management.GetProxyURL,
+		RefreshAccount: func(refreshCtx context.Context, accountID string) error {
+			_, refreshErr := oauthRefresh.RefreshAccount(refreshCtx, accountID)
+			return refreshErr
+		},
 		BackgroundContext: ctx,
 		MaxBodyBytesFunc: func() int64 {
 			return runtimeSettings.Active().MaxRequestBytes

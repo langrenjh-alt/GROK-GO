@@ -81,6 +81,39 @@ func TestAuthTOTPEnrollmentAndLogin(t *testing.T) {
 	}
 }
 
+func TestAuthVerifyCredentialsRequiresPasswordAndTOTP(t *testing.T) {
+	ctx := context.Background()
+	service, repo := newTestAuthService(t)
+	principal, err := service.Bootstrap(ctx, "admin@example.com", "correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.VerifyCredentials(ctx, principal.ID, "wrong password", ""); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("VerifyCredentials(wrong password) error = %v", err)
+	}
+	if err := service.VerifyCredentials(ctx, principal.ID, "correct horse battery staple", ""); err != nil {
+		t.Fatalf("VerifyCredentials(password) error = %v", err)
+	}
+
+	enrollment, err := service.BeginTOTP(ctx, principal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := testTOTPCode(t, enrollment.Secret, service.now())
+	if err := service.ConfirmTOTP(ctx, principal.ID, code); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.VerifyCredentials(ctx, principal.ID, "correct horse battery staple", ""); !errors.Is(err, ErrInvalidTOTP) {
+		t.Fatalf("VerifyCredentials(missing TOTP) error = %v", err)
+	}
+	if err := service.VerifyCredentials(ctx, principal.ID, "correct horse battery staple", code); err != nil {
+		t.Fatalf("VerifyCredentials(TOTP) error = %v", err)
+	}
+	if record, err := repo.GetAdminByID(ctx, principal.ID); err != nil || !record.TOTPEnabled {
+		t.Fatalf("TOTP state = %+v, %v", record, err)
+	}
+}
+
 func TestAuthCredentialChangesValidateAndRevokeSessions(t *testing.T) {
 	service, repo := newTestAuthService(t)
 	ctx := context.Background()

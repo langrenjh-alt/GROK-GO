@@ -17,6 +17,10 @@ $env:CGO_ENABLED = '0'
 $binary = Join-Path $output 'grok-go-linux-amd64'
 Push-Location $root
 try {
+    pnpm --dir web build
+    if ($LASTEXITCODE -ne 0) { throw "Frontend build failed with exit code $LASTEXITCODE." }
+    & (Join-Path $PSScriptRoot 'build-web.ps1')
+
     if (-not $Version) { $Version = (git describe --tags --always --dirty 2>$null) }
     if (-not $Version) { $Version = 'dev' }
     if (-not $Commit) { $Commit = (git rev-parse HEAD 2>$null) }

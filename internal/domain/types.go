@@ -65,27 +65,28 @@ type QuotaSnapshot struct {
 }
 
 type Account struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	Kind                CredentialKind `json:"kind"`
-	Tier                string         `json:"tier"`
-	Status              AccountStatus  `json:"status"`
-	Email               string         `json:"email,omitempty"`
-	CredentialExpiresAt *time.Time     `json:"credential_expires_at,omitempty"`
-	CredentialCipher    []byte         `json:"-"`
-	ProxyID             string         `json:"proxy_id,omitempty"`
-	Models              []string       `json:"models,omitempty"`
-	Tags                []string       `json:"tags,omitempty"`
-	Priority            int            `json:"priority"`
-	ConcurrencyLimit    int            `json:"concurrency_limit"`
-	HealthScore         float64        `json:"health_score"`
-	FailureCount        int            `json:"failure_count"`
-	Quota               QuotaSnapshot  `json:"quota"`
-	CooldownUntil       *time.Time     `json:"cooldown_until,omitempty"`
-	LastUsedAt          *time.Time     `json:"last_used_at,omitempty"`
-	LastError           string         `json:"last_error,omitempty"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	ID                    string         `json:"id"`
+	Name                  string         `json:"name"`
+	Kind                  CredentialKind `json:"kind"`
+	Tier                  string         `json:"tier"`
+	Status                AccountStatus  `json:"status"`
+	Email                 string         `json:"email,omitempty"`
+	CredentialExpiresAt   *time.Time     `json:"credential_expires_at,omitempty"`
+	CredentialCipher      []byte         `json:"-"`
+	CredentialFingerprint []byte         `json:"-"`
+	ProxyID               string         `json:"proxy_id,omitempty"`
+	Models                []string       `json:"models,omitempty"`
+	Tags                  []string       `json:"tags,omitempty"`
+	Priority              int            `json:"priority"`
+	ConcurrencyLimit      int            `json:"concurrency_limit"`
+	HealthScore           float64        `json:"health_score"`
+	FailureCount          int            `json:"failure_count"`
+	Quota                 QuotaSnapshot  `json:"quota"`
+	CooldownUntil         *time.Time     `json:"cooldown_until,omitempty"`
+	LastUsedAt            *time.Time     `json:"last_used_at,omitempty"`
+	LastError             string         `json:"last_error,omitempty"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 
 type ModelSpec struct {
@@ -145,6 +146,7 @@ type RequestLog struct {
 	InputTokens  int64           `json:"input_tokens"`
 	OutputTokens int64           `json:"output_tokens"`
 	CachedTokens int64           `json:"cached_tokens"`
+	UsageParsed  bool            `json:"usage_parsed"`
 	ErrorCode    string          `json:"error_code,omitempty"`
 	ErrorSummary string          `json:"error_summary,omitempty"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`

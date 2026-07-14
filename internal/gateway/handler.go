@@ -26,6 +26,7 @@ type Config struct {
 	Videos            VideoStore
 	Media             MediaLocalizer
 	ProxyURL          func(context.Context, string) (string, error)
+	RefreshAccount    func(context.Context, string) error
 	OnCompletion      func(context.Context, Completion)
 	HeartbeatInterval time.Duration
 	MaxBodyBytes      int64
@@ -206,6 +207,7 @@ func (h *Handler) reportCompletion(ctx context.Context, lease *accounts.Lease, v
 
 func (h *Handler) invoke(ctx context.Context, operation upstream.Operation, model domain.ModelSpec, body json.RawMessage, headers http.Header, stream bool, affinity string) (*upstream.Response, *accounts.Lease, error) {
 	excluded := make(map[string]struct{})
+	refreshed := make(map[string]struct{})
 	var lastErr error
 	for attempt := 0; attempt < h.config.MaxAttempts; attempt++ {
 		lease, err := h.config.Accounts.Acquire(ctx, accounts.Selection{Model: model, AffinityKey: affinity, ExcludeIDs: excluded})
@@ -231,6 +233,18 @@ func (h *Handler) invoke(ctx context.Context, operation upstream.Operation, mode
 			excluded[lease.Account.ID] = struct{}{}
 			_ = lease.Release(context.Background(), accounts.Feedback{StatusCode: http.StatusBadGateway, Err: err})
 			continue
+		}
+		if response.StatusCode == http.StatusUnauthorized && lease.Account.Kind == domain.CredentialCLIOAuth && h.config.RefreshAccount != nil && attempt+1 < h.config.MaxAttempts {
+			if _, alreadyRefreshed := refreshed[lease.Account.ID]; !alreadyRefreshed {
+				refreshed[lease.Account.ID] = struct{}{}
+				refreshErr := h.config.RefreshAccount(ctx, lease.Account.ID)
+				_ = lease.Release(context.Background(), accounts.Feedback{StatusCode: 499})
+				if refreshErr != nil {
+					lastErr = refreshErr
+					excluded[lease.Account.ID] = struct{}{}
+				}
+				continue
+			}
 		}
 		if retryable(response.StatusCode) && attempt+1 < h.config.MaxAttempts {
 			lastErr = errors.New(upstreamErrorMessage(response))
@@ -402,18 +416,59 @@ func quotaFromHeaders(header http.Header, observedAt time.Time) *domain.QuotaSna
 	seen = readQuotaMetric(header, []string{"X-RateLimit-Remaining-Requests", "RateLimit-Remaining"}, &quota.RequestsRemaining, nil) || seen
 	seen = readQuotaMetric(header, []string{"X-RateLimit-Limit-Tokens"}, &quota.TokensLimit, &quota.TokensUnlimited) || seen
 	seen = readQuotaMetric(header, []string{"X-RateLimit-Remaining-Tokens"}, &quota.TokensRemaining, nil) || seen
-	for _, name := range []string{"X-RateLimit-Reset-Requests", "X-RateLimit-Reset-Tokens", "X-RateLimit-Reset", "RateLimit-Reset"} {
-		if value := strings.TrimSpace(header.Get(name)); value != "" {
-			if reset, ok := parseQuotaReset(value, observedAt); ok && (quota.ResetAt == nil || reset.After(*quota.ResetAt)) {
-				quota.ResetAt = &reset
-			}
-			seen = true
-		}
+	requestReset, requestResetSeen := quotaResetFromHeaders(header, []string{"X-RateLimit-Reset-Requests"}, observedAt)
+	tokenReset, tokenResetSeen := quotaResetFromHeaders(header, []string{"X-RateLimit-Reset-Tokens"}, observedAt)
+	commonReset, commonResetSeen := quotaResetFromHeaders(header, []string{"X-RateLimit-Reset", "RateLimit-Reset"}, observedAt)
+	seen = seen || requestResetSeen || tokenResetSeen || commonResetSeen
+	requestExhausted := !quota.RequestsUnlimited && quota.RequestsLimit > 0 && quota.RequestsRemaining <= 0
+	tokenExhausted := !quota.TokensUnlimited && quota.TokensLimit > 0 && quota.TokensRemaining <= 0
+	switch {
+	case requestExhausted && tokenExhausted:
+		quota.ResetAt = laterReset(firstReset(requestReset, commonReset), firstReset(tokenReset, commonReset))
+	case requestExhausted:
+		quota.ResetAt = firstReset(requestReset, commonReset)
+	case tokenExhausted:
+		quota.ResetAt = firstReset(tokenReset, commonReset)
+	default:
+		quota.ResetAt = laterReset(laterReset(requestReset, tokenReset), commonReset)
 	}
 	if !seen {
 		return nil
 	}
 	return &quota
+}
+
+func quotaResetFromHeaders(header http.Header, names []string, observedAt time.Time) (*time.Time, bool) {
+	var result *time.Time
+	seen := false
+	for _, name := range names {
+		value := strings.TrimSpace(header.Get(name))
+		if value == "" {
+			continue
+		}
+		seen = true
+		if reset, ok := parseQuotaReset(value, observedAt); ok && (result == nil || reset.After(*result)) {
+			result = &reset
+		}
+	}
+	return result, seen
+}
+
+func firstReset(primary, fallback *time.Time) *time.Time {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}
+
+func laterReset(left, right *time.Time) *time.Time {
+	if left == nil {
+		return right
+	}
+	if right == nil || left.After(*right) {
+		return left
+	}
+	return right
 }
 
 func readQuotaMetric(header http.Header, names []string, destination *int64, unlimited *bool) bool {

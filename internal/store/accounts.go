@@ -10,7 +10,7 @@ import (
 )
 
 const accountColumns = `
-	id, name, kind, tier, status, email, credential_cipher, proxy_id,
+	id, name, kind, tier, status, email, credential_cipher, credential_fingerprint, proxy_id,
 	models, tags, priority, concurrency_limit, health_score, failure_count, quota, cooldown_until,
 	last_used_at, last_error, created_at, updated_at`
 
@@ -53,17 +53,17 @@ func (p *Postgres) CreateAccount(ctx context.Context, account *domain.Account) e
 	}
 	err = p.db.QueryRow(ctx, `
 		INSERT INTO accounts (
-			id, name, kind, tier, status, email, credential_cipher, proxy_id,
+			id, name, kind, tier, status, email, credential_cipher, credential_fingerprint, proxy_id,
 			models, tags, priority, concurrency_limit, health_score, failure_count, quota, cooldown_until,
 			last_used_at, last_error
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8,
-			$9::jsonb, $10::jsonb, $11, $12, $13, $14, $15::jsonb, $16,
-			$17, $18
+			$1, $2, $3, $4, $5, $6, $7, $8, $9,
+			$10::jsonb, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17,
+			$18, $19
 		)
 		RETURNING created_at, updated_at`,
 		id, strings.TrimSpace(account.Name), account.Kind, account.Tier, account.Status,
-		account.Email, account.CredentialCipher, nullableString(account.ProxyID), models, tags,
+		account.Email, account.CredentialCipher, nullableBytes(account.CredentialFingerprint), nullableString(account.ProxyID), models, tags,
 		account.Priority, account.ConcurrencyLimit, account.HealthScore, account.FailureCount,
 		quota, account.CooldownUntil, account.LastUsedAt, account.LastError,
 	).Scan(&account.CreatedAt, &account.UpdatedAt)
@@ -141,6 +141,67 @@ func (p *Postgres) UpdateAccount(ctx context.Context, account *domain.Account) e
 	return updateAccount(ctx, p.db, account)
 }
 
+// UpdateAccountRuntime applies hot-path health feedback without overwriting
+// administrator scheduling edits or credentials refreshed by another instance.
+func (p *Postgres) UpdateAccountRuntime(ctx context.Context, account *domain.Account) error {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return errorsNew("account ID is required")
+	}
+	quota, err := marshalJSON(account.Quota, "{}")
+	if err != nil {
+		return err
+	}
+	err = p.db.QueryRow(ctx, `
+		UPDATE accounts SET
+			status = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN status
+				WHEN $2 = 'active' AND status = 'cooldown' AND cooldown_until > now() THEN status
+				ELSE $2
+			END,
+			health_score = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN health_score
+				WHEN $2 = 'active' AND status = 'cooldown' AND cooldown_until > now() THEN health_score
+				ELSE $3
+			END,
+			failure_count = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN failure_count
+				WHEN $2 = 'active' AND status = 'cooldown' AND cooldown_until > now() THEN failure_count
+				ELSE $4
+			END,
+			quota = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN quota
+				ELSE $5::jsonb
+			END,
+			cooldown_until = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN cooldown_until
+				WHEN $2 = 'active' AND status = 'cooldown' AND cooldown_until > now() THEN cooldown_until
+				WHEN $2 = 'cooldown' AND cooldown_until IS NOT NULL AND ($6::timestamptz IS NULL OR cooldown_until > $6) THEN cooldown_until
+				ELSE $6
+			END,
+			last_used_at = CASE
+				WHEN credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN last_used_at
+				WHEN $7::timestamptz IS NULL THEN last_used_at
+				WHEN last_used_at IS NULL THEN $7
+				ELSE GREATEST(last_used_at, $7)
+			END,
+			last_error = CASE
+				WHEN status IN ('disabled', 'expired', 'error') OR credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN last_error
+				WHEN $2 = 'active' AND status = 'cooldown' AND cooldown_until > now() THEN last_error
+				ELSE $8
+			END,
+			updated_at = CASE
+				WHEN credential_fingerprint IS DISTINCT FROM $9 OR credential_cipher IS DISTINCT FROM $10 THEN updated_at
+				ELSE now()
+			END
+		WHERE id = $1
+		RETURNING updated_at`,
+		account.ID, account.Status, account.HealthScore, account.FailureCount,
+		quota, account.CooldownUntil, account.LastUsedAt, account.LastError,
+		nullableBytes(account.CredentialFingerprint), account.CredentialCipher,
+	).Scan(&account.UpdatedAt)
+	return translateError(err)
+}
+
 func (p *Postgres) UpdateAccounts(ctx context.Context, accounts []*domain.Account) error {
 	if len(accounts) == 0 {
 		return errorsNew("at least one account is required")
@@ -183,14 +244,14 @@ func updateAccount(ctx context.Context, database dbtx, account *domain.Account) 
 	err = database.QueryRow(ctx, `
 		UPDATE accounts SET
 			name = $2, kind = $3, tier = $4, status = $5, email = $6,
-			credential_cipher = $7, proxy_id = $8, models = $9::jsonb,
-			tags = $10::jsonb, priority = $11, concurrency_limit = $12,
-			health_score = $13, failure_count = $14, quota = $15::jsonb,
-			cooldown_until = $16, last_used_at = $17,
-			last_error = $18, updated_at = now()
+			credential_cipher = $7, credential_fingerprint = $8, proxy_id = $9, models = $10::jsonb,
+			tags = $11::jsonb, priority = $12, concurrency_limit = $13,
+			health_score = $14, failure_count = $15, quota = $16::jsonb,
+			cooldown_until = $17, last_used_at = $18,
+			last_error = $19, updated_at = now()
 		WHERE id = $1 RETURNING updated_at`,
 		account.ID, strings.TrimSpace(account.Name), account.Kind, account.Tier,
-		account.Status, account.Email, account.CredentialCipher, nullableString(account.ProxyID),
+		account.Status, account.Email, account.CredentialCipher, nullableBytes(account.CredentialFingerprint), nullableString(account.ProxyID),
 		models, tags, account.Priority, account.ConcurrencyLimit, account.HealthScore,
 		account.FailureCount, quota, account.CooldownUntil, account.LastUsedAt, account.LastError,
 	).Scan(&account.UpdatedAt)
@@ -215,7 +276,7 @@ func scanAccount(row rowScanner) (*domain.Account, error) {
 	var models, tags, quota []byte
 	err := row.Scan(
 		&account.ID, &account.Name, &kind, &account.Tier, &status, &account.Email,
-		&account.CredentialCipher, &proxyID, &models, &tags, &account.Priority,
+		&account.CredentialCipher, &account.CredentialFingerprint, &proxyID, &models, &tags, &account.Priority,
 		&account.ConcurrencyLimit, &account.HealthScore, &account.FailureCount, &quota,
 		&account.CooldownUntil, &account.LastUsedAt,
 		&account.LastError, &account.CreatedAt, &account.UpdatedAt,

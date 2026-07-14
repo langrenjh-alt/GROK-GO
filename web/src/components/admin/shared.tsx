@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import type { AccountStatus } from "@/lib/types";
 
 export function ContentFrame({ children }: { children: React.ReactNode }) {
-  return <div className="min-w-0 pb-10">{children}</div>;
+  return <div className="w-full min-w-0 max-w-full overflow-x-hidden pb-10">{children}</div>;
 }
 
 export function Toolbar({ search, onSearch, placeholder, filter, onFilter, filterOptions, filters, trailing }: { search: string; onSearch: (value: string) => void; placeholder: string; filter?: string; onFilter?: (value: string) => void; filterOptions?: Array<{ label: string; value: string }>; filters?: React.ReactNode; trailing?: React.ReactNode }) {

@@ -54,6 +54,9 @@ type CreateAccountInput struct {
 	Tags             []string
 	Priority         int
 	ConcurrencyLimit int
+	Quota            domain.QuotaSnapshot
+	CooldownUntil    *time.Time
+	LastError        string
 }
 
 type UpdateAccountInput struct {
@@ -117,7 +120,16 @@ func (s *ManagementService) CreateAccount(ctx context.Context, input CreateAccou
 	if s.accounts == nil || s.cipher == nil {
 		return nil, errors.New("account management is not configured")
 	}
+	credentials, err := normalizeAccountCredentials(input.Kind, input.Credentials)
+	if err != nil {
+		return nil, err
+	}
+	input.Credentials = credentials
 	if err := validateAccountInput(input.Name, input.Kind, input.Credentials, input.ConcurrencyLimit); err != nil {
+		return nil, err
+	}
+	proxyID := strings.TrimSpace(input.ProxyID)
+	if err := s.validateAccountProxy(ctx, &proxyID); err != nil {
 		return nil, err
 	}
 	id, err := security.GenerateID()
@@ -142,8 +154,10 @@ func (s *ManagementService) CreateAccount(ctx context.Context, input CreateAccou
 	account := &domain.Account{
 		ID: id, Name: strings.TrimSpace(input.Name), Kind: input.Kind, Tier: strings.TrimSpace(input.Tier),
 		Status: status, Email: normalizeEmail(input.Email), CredentialCipher: credentialCipher,
-		ProxyID: strings.TrimSpace(input.ProxyID), Models: cleanStrings(input.Models), Tags: cleanStrings(input.Tags),
+		CredentialFingerprint: s.AccountCredentialFingerprint(input.Kind, input.Credentials),
+		ProxyID:               proxyID, Models: cleanStrings(input.Models), Tags: cleanStrings(input.Tags),
 		Priority: input.Priority, ConcurrencyLimit: concurrency, HealthScore: 1,
+		Quota: input.Quota, CooldownUntil: input.CooldownUntil, LastError: sanitizeAccountError(input.LastError),
 	}
 	if err := s.accounts.CreateAccount(ctx, account); err != nil {
 		return nil, err
@@ -165,6 +179,26 @@ func (s *ManagementService) GetAccountCredentials(ctx context.Context, id string
 		return domain.Credentials{}, err
 	}
 	return s.openCredentials(account.ID, account.CredentialCipher)
+}
+
+// AccountCredentialFingerprint returns a keyed, non-reversible identity used
+// to make repeated credential imports idempotent.
+func (s *ManagementService) AccountCredentialFingerprint(kind domain.CredentialKind, credentials domain.Credentials) []byte {
+	if s == nil || s.tokens == nil {
+		return nil
+	}
+	secret := ""
+	switch kind {
+	case domain.CredentialCLIOAuth:
+		secret = firstCredential(credentials.RefreshToken, credentials.AccessToken)
+	case domain.CredentialConsoleSSO, domain.CredentialGrokSSO:
+		secret = firstCredential(credentials.SSO, credentials.SSORW)
+	}
+	secret = strings.TrimSpace(strings.TrimPrefix(secret, "sso="))
+	if secret == "" {
+		return nil
+	}
+	return s.tokens.Digest("account-credential:v1:" + string(kind) + ":" + secret)
 }
 
 func (s *ManagementService) ListAccounts(ctx context.Context, filter store.AccountFilter) ([]domain.Account, error) {
@@ -329,7 +363,7 @@ func (s *ManagementService) prepareAccountUpdate(account *domain.Account, input 
 		account.CooldownUntil = *input.CooldownUntil
 	}
 	if input.LastError != nil {
-		account.LastError = strings.TrimSpace(*input.LastError)
+		account.LastError = sanitizeAccountError(*input.LastError)
 	}
 	credentials, err := s.openCredentials(account.ID, account.CredentialCipher)
 	if err != nil {
@@ -337,15 +371,52 @@ func (s *ManagementService) prepareAccountUpdate(account *domain.Account, input 
 	}
 	if input.Credentials != nil {
 		credentials = *input.Credentials
+	}
+	credentials, err = normalizeAccountCredentials(account.Kind, credentials)
+	if err != nil {
+		return err
+	}
+	if input.Credentials != nil || account.CredentialFingerprint == nil {
 		account.CredentialCipher, err = s.sealCredentials(account.ID, credentials)
 		if err != nil {
 			return err
 		}
 	}
+	account.CredentialFingerprint = s.AccountCredentialFingerprint(account.Kind, credentials)
 	if err := validateAccountInput(account.Name, account.Kind, credentials, account.ConcurrencyLimit); err != nil {
 		return err
 	}
 	return nil
+}
+
+func firstCredential(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func sanitizeAccountError(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{
+		"http://", "https://", "authorization", "bearer ", "access_token", "access token", "access-token",
+		"refresh_token", "refresh token", "refresh-token", "id_token", "id token", "id-token", "sso=",
+	} {
+		if strings.Contains(lower, marker) {
+			return "redacted upstream error"
+		}
+	}
+	runes := []rune(value)
+	if len(runes) > 256 {
+		value = string(runes[:256])
+	}
+	return value
 }
 
 func validAccountStatus(status domain.AccountStatus) bool {
@@ -656,6 +727,65 @@ func validateAccountInput(name string, kind domain.CredentialKind, credentials d
 	return nil
 }
 
+func normalizeAccountCredentials(kind domain.CredentialKind, credentials domain.Credentials) (domain.Credentials, error) {
+	credentials.AccessToken = strings.TrimSpace(credentials.AccessToken)
+	credentials.RefreshToken = strings.TrimSpace(credentials.RefreshToken)
+	credentials.IDToken = strings.TrimSpace(credentials.IDToken)
+	credentials.SSO = strings.TrimSpace(strings.TrimPrefix(credentials.SSO, "sso="))
+	credentials.SSORW = strings.TrimSpace(strings.TrimPrefix(credentials.SSORW, "sso="))
+	credentials.BaseURL = strings.TrimSpace(credentials.BaseURL)
+	switch kind {
+	case domain.CredentialCLIOAuth:
+		if credentials.TokenType == "" {
+			credentials.TokenType = "Bearer"
+		} else if !strings.EqualFold(strings.TrimSpace(credentials.TokenType), "Bearer") {
+			return domain.Credentials{}, errors.New("CLI OAuth token type must be Bearer")
+		} else {
+			credentials.TokenType = "Bearer"
+		}
+		if credentials.BaseURL == "" {
+			credentials.BaseURL = "https://cli-chat-proxy.grok.com/v1"
+		} else if err := requireOfficialCredentialURL(credentials.BaseURL, map[string]string{
+			"cli-chat-proxy.grok.com": "/v1",
+			"api.x.ai":                "/v1",
+		}); err != nil {
+			return domain.Credentials{}, errors.New("CLI OAuth base URL must use an official xAI endpoint")
+		} else {
+			credentials.BaseURL = "https://cli-chat-proxy.grok.com/v1"
+		}
+	case domain.CredentialConsoleSSO:
+		if credentials.BaseURL != "" {
+			if err := requireOfficialCredentialURL(credentials.BaseURL, map[string]string{"console.x.ai": "/v1"}); err != nil {
+				return domain.Credentials{}, errors.New("Console SSO base URL must use the official xAI endpoint")
+			}
+			credentials.BaseURL = "https://console.x.ai/v1"
+		}
+	case domain.CredentialGrokSSO:
+		if credentials.BaseURL != "" {
+			if err := requireOfficialCredentialURL(credentials.BaseURL, map[string]string{"grok.com": ""}); err != nil {
+				return domain.Credentials{}, errors.New("Grok SSO base URL must use the official Grok endpoint")
+			}
+			credentials.BaseURL = "https://grok.com"
+		}
+	}
+	return credentials, nil
+}
+
+func requireOfficialCredentialURL(raw string, allowed map[string]string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Port() != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return errors.New("invalid credential URL")
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Host, parsed.Hostname()) {
+		return errors.New("invalid credential URL")
+	}
+	wantPath, ok := allowed[strings.ToLower(parsed.Hostname())]
+	if !ok || strings.TrimRight(parsed.Path, "/") != wantPath {
+		return errors.New("invalid credential URL")
+	}
+	return nil
+}
+
 func validateModel(model *domain.ModelSpec) error {
 	if model == nil || strings.TrimSpace(model.ID) == "" || strings.TrimSpace(model.UpstreamModel) == "" || strings.TrimSpace(model.DisplayName) == "" {
 		return errors.New("model ID, upstream model, and display name are required")
@@ -701,6 +831,7 @@ func cleanStrings(values []string) []string {
 func sanitizedAccount(account *domain.Account) *domain.Account {
 	copy := *account
 	copy.CredentialCipher = nil
+	copy.CredentialFingerprint = nil
 	return &copy
 }
 

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,11 +88,75 @@ func TestValidateModelAcceptsImageEditCapability(t *testing.T) {
 	}
 }
 
+func TestManagementPinsCredentialOriginsAndFingerprintsSecrets(t *testing.T) {
+	repository := &fakeAccountRepo{values: map[string]*domain.Account{}}
+	cipher, _ := security.NewCipher([]byte("0123456789abcdef0123456789abcdef"))
+	tokens, _ := security.NewTokenManager([]byte("abcdef0123456789abcdef0123456789"))
+	service := NewManagementService(repository, nil, nil, nil, nil, cipher, tokens)
+
+	created, err := service.CreateAccount(context.Background(), CreateAccountInput{
+		Name: "OAuth", Kind: domain.CredentialCLIOAuth,
+		Credentials: domain.Credentials{AccessToken: "access-one", RefreshToken: "stable-refresh", BaseURL: "https://api.x.ai/v1", TokenType: "bearer"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := repository.values[created.ID]
+	if len(stored.CredentialFingerprint) == 0 || len(created.CredentialFingerprint) != 0 {
+		t.Fatalf("fingerprint storage/redaction = stored:%d returned:%d", len(stored.CredentialFingerprint), len(created.CredentialFingerprint))
+	}
+	credentials, err := service.GetAccountCredentials(context.Background(), created.ID)
+	if err != nil || credentials.BaseURL != "https://cli-chat-proxy.grok.com/v1" || credentials.TokenType != "Bearer" {
+		t.Fatalf("normalized credentials = %+v, %v", credentials, err)
+	}
+	firstFingerprint := append([]byte(nil), stored.CredentialFingerprint...)
+	credentials.AccessToken = "access-two"
+	if _, err := service.UpdateAccount(context.Background(), created.ID, UpdateAccountInput{Credentials: &credentials}); err != nil {
+		t.Fatal(err)
+	}
+	if string(repository.values[created.ID].CredentialFingerprint) != string(firstFingerprint) {
+		t.Fatal("access-token rotation changed the refresh-token credential identity")
+	}
+
+	for _, test := range []CreateAccountInput{
+		{Name: "Bad OAuth", Kind: domain.CredentialCLIOAuth, Credentials: domain.Credentials{AccessToken: "a", BaseURL: "https://example.test/v1"}},
+		{Name: "Bad Console", Kind: domain.CredentialConsoleSSO, Credentials: domain.Credentials{SSO: "s", BaseURL: "https://example.test/v1"}},
+		{Name: "Bad Grok", Kind: domain.CredentialGrokSSO, Credentials: domain.Credentials{SSO: "s", BaseURL: "https://example.test"}},
+	} {
+		if _, err := service.CreateAccount(context.Background(), test); err == nil {
+			t.Fatalf("accepted custom credential origin for %s", test.Kind)
+		}
+	}
+}
+
+func TestSanitizeAccountErrorRedactsSecretsURLsAndBoundsText(t *testing.T) {
+	for _, value := range []string{
+		`Post "https://grok.com/path": dial failed`,
+		"Authorization: Bearer secret",
+		"refresh_token=secret",
+		"sso=secret",
+	} {
+		if got := sanitizeAccountError(value); got != "redacted upstream error" {
+			t.Fatalf("sanitizeAccountError(%q) = %q", value, got)
+		}
+	}
+	plain := strings.Repeat("x", 300)
+	if got := sanitizeAccountError(plain); len([]rune(got)) != 256 {
+		t.Fatalf("bounded account error length = %d", len([]rune(got)))
+	}
+	if got := sanitizeAccountError("rate limited"); got != "rate limited" {
+		t.Fatalf("plain account error = %q", got)
+	}
+}
+
 func TestBatchUpdateAccountsPrevalidatesAndWritesAtomically(t *testing.T) {
 	accounts := &fakeAccountRepo{values: map[string]*domain.Account{}}
 	proxies := &fakeProxyRepo{values: map[string]*domain.Proxy{"proxy-1": {ID: "proxy-1", Name: "Primary"}}}
 	cipher, _ := security.NewCipher([]byte("0123456789abcdef0123456789abcdef"))
 	service := NewManagementService(accounts, nil, proxies, nil, nil, cipher, nil)
+	if _, err := service.CreateAccount(context.Background(), CreateAccountInput{Name: "Missing proxy", Kind: domain.CredentialGrokSSO, Credentials: domain.Credentials{SSO: "missing-proxy"}, ProxyID: "missing"}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("create account missing proxy error = %v", err)
+	}
 	first, err := service.CreateAccount(context.Background(), CreateAccountInput{Name: "First", Kind: domain.CredentialGrokSSO, Credentials: domain.Credentials{SSO: "first"}, ConcurrencyLimit: 1})
 	if err != nil {
 		t.Fatal(err)

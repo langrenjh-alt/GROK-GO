@@ -1,4 +1,4 @@
-import { API_BASE, apiFetch } from "./api";
+import { API_BASE, apiFetch, apiFetchResponse } from "./api";
 
 describe("apiFetch", () => {
   afterEach(() => {
@@ -46,5 +46,35 @@ describe("apiFetch", () => {
     const formHeaders = new Headers((fetchMock.mock.calls[1][1] as RequestInit).headers);
     expect(formHeaders.get("X-CSRF-Token")).toBe("csrf_token_123");
     expect(formHeaders.has("Content-Type")).toBe(false);
+  });
+
+  it("returns an unconsumed attachment response with its headers", async () => {
+    document.cookie = "grok_go_csrf=csrf_token_123; Path=/";
+    const fetchMock = vi.fn().mockResolvedValue(new Response("export-data", {
+      status: 200,
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-disposition": "attachment; filename=accounts.json",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await apiFetchResponse("/accounts/export", {
+      method: "POST",
+      headers: { Accept: "application/octet-stream" },
+      body: JSON.stringify({ ids: ["account-1"] }),
+    });
+
+    expect(response.headers.get("content-disposition")).toBe("attachment; filename=accounts.json");
+    await expect(response.text()).resolves.toBe("export-data");
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const headers = new Headers(init.headers);
+    expect(headers.get("Accept")).toBe("application/octet-stream");
+    expect(headers.get("X-CSRF-Token")).toBe("csrf_token_123");
+  });
+
+  it("preserves structured API errors for raw responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { code: "incompatible_accounts", message: "Unsupported account type" } }), { status: 400, headers: { "content-type": "application/json" } })));
+    await expect(apiFetchResponse("/accounts/export", { method: "POST" })).rejects.toMatchObject({ status: 400, code: "incompatible_accounts", message: "Unsupported account type" });
   });
 });
