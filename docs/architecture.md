@@ -61,12 +61,18 @@ credential-refresh transition rather than stale runtime feedback.
 
 ## Prompt cache identity
 
-The gateway derives one stable, tenant-isolated UUID-shaped identity from the
-strongest available conversation signal: session headers, an explicit prompt
-cache key, request metadata, Anthropic ephemeral cache blocks, or the stable
-system/tool/first-user prefix. It is used both as the upstream prompt cache
-identity and as the account-affinity key. Hashing the downstream credential
-into the identity namespace prevents cache affinity from crossing tenants.
+The gateway derives two stable UUID-shaped identities. The session-affinity
+identity uses the strongest available conversation signal: session headers,
+an explicit prompt cache key, request metadata, Anthropic ephemeral cache
+blocks, or the stable system/tool/first-user prefix. It includes a digest of
+the downstream credential so account affinity cannot cross tenants.
+
+The upstream prompt-cache identity uses the model and normalized static prompt
+prefix and is global across downstream API keys. This lets identical system,
+developer, and tool prefixes share upstream cache routing without merging
+conversation affinity or sharing response bodies. When no static prefix exists,
+the first user input is included so unrelated requests do not collapse into one
+cache identity.
 The Redis affinity TTL is refreshed on a successful compare against the current
 binding. GROK-GO does not cache text response bodies locally; cache-rate values
 come from upstream cached-input token usage.

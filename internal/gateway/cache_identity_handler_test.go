@@ -16,8 +16,8 @@ import (
 
 type cacheIdentityAuth struct{}
 
-func (cacheIdentityAuth) AuthenticateClientKey(context.Context, string) (*domain.ClientKey, error) {
-	return &domain.ClientKey{ID: "authenticated-key-id", Enabled: true}, nil
+func (cacheIdentityAuth) AuthenticateClientKey(_ context.Context, token string) (*domain.ClientKey, error) {
+	return &domain.ClientKey{ID: "authenticated-" + token, Enabled: true}, nil
 }
 
 type cacheIdentityCounters struct{}
@@ -32,7 +32,7 @@ func (cacheIdentityCounters) AcquireSlot(context.Context, string, int, time.Dura
 
 func (cacheIdentityCounters) ReleaseSlot(context.Context, string) error { return nil }
 
-func TestGatewayPromptCacheIdentityUsesAuthenticatedKeyAndStaticPrefix(t *testing.T) {
+func TestGatewayPromptCacheIdentityIsGlobalAcrossAuthenticatedKeys(t *testing.T) {
 	var mu sync.Mutex
 	keys := make([]string, 0, 2)
 	client := upstream.ClientFunc(func(_ context.Context, request upstream.Request) (*upstream.Response, error) {

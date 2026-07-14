@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestCacheIdentitiesStableAndTenantIsolated(t *testing.T) {
+func TestCacheIdentitiesKeepTenantAffinityAndSharePromptCacheGlobally(t *testing.T) {
 	payload := map[string]any{
 		"messages": []any{
 			map[string]any{"role": "system", "content": "Be concise"},
@@ -20,8 +20,11 @@ func TestCacheIdentitiesStableAndTenantIsolated(t *testing.T) {
 		t.Fatalf("identities changed: %#v != %#v", repeated, first)
 	}
 	other := resolveCacheIdentities("key-b", nil, "grok-4.5", payload)
-	if other.SessionAffinityKey == first.SessionAffinityKey || other.PromptCacheKey == first.PromptCacheKey {
-		t.Fatal("different authenticated client keys shared a cache identity")
+	if other.SessionAffinityKey == first.SessionAffinityKey {
+		t.Fatal("different authenticated client keys shared session affinity")
+	}
+	if other.PromptCacheKey != first.PromptCacheKey {
+		t.Fatal("identical prompt prefixes did not share the global prompt cache identity")
 	}
 	for name, value := range map[string]string{"session affinity": first.SessionAffinityKey, "prompt cache": first.PromptCacheKey} {
 		if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(value) {
@@ -40,8 +43,11 @@ func TestCacheIdentitiesUseAuthenticatedKeyIDAcrossHeaderStyles(t *testing.T) {
 		t.Fatalf("the same authenticated key ID was split by auth header style: %#v != %#v", first, second)
 	}
 	third := resolveCacheIdentities("key-2", bearer, "grok", payload)
-	if third.SessionAffinityKey == first.SessionAffinityKey || third.PromptCacheKey == first.PromptCacheKey {
-		t.Fatal("different authenticated key IDs shared a cache identity")
+	if third.SessionAffinityKey == first.SessionAffinityKey {
+		t.Fatal("different authenticated key IDs shared session affinity")
+	}
+	if third.PromptCacheKey != first.PromptCacheKey {
+		t.Fatal("authentication identity fragmented the global prompt cache")
 	}
 }
 

@@ -8,6 +8,9 @@ All notable changes to GROK-GO are documented in this file.
 
 - Raised the configurable process-wide gateway concurrency ceiling from 10,000
   to 1,000,000 without changing the default of 32.
+- Made the upstream prompt-cache identity global across downstream API keys
+  when the model and normalized static prompt prefix match. Conversation and
+  account affinity remain tenant-isolated.
 
 ## [0.1.2] - 2026-07-14
 

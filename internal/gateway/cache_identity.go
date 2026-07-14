@@ -30,8 +30,8 @@ func requestCacheIdentities(r *http.Request, model string, payload map[string]an
 // reusable static prefix sent to the upstream prompt cache.
 func resolveCacheIdentities(tenantID string, headers http.Header, model string, payload map[string]any) cacheIdentities {
 	return cacheIdentities{
-		SessionAffinityKey: uuidCacheIdentity("grok-session-affinity:v2", tenantID, model, sessionAffinitySeed(headers, model, payload)),
-		PromptCacheKey:     uuidCacheIdentity("grok-prompt-cache:v2", tenantID, model, promptCachePrefix(model, payload)),
+		SessionAffinityKey: tenantCacheIdentity("grok-session-affinity:v2", tenantID, model, sessionAffinitySeed(headers, model, payload)),
+		PromptCacheKey:     globalCacheIdentity("grok-prompt-cache:v3", model, promptCachePrefix(model, payload)),
 	}
 }
 
@@ -53,7 +53,7 @@ func sessionAffinitySeed(headers http.Header, model string, payload map[string]a
 	return seed
 }
 
-func uuidCacheIdentity(namespace, tenantID, model, seed string) string {
+func tenantCacheIdentity(namespace, tenantID, model, seed string) string {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		tenantID = "public"
@@ -61,7 +61,15 @@ func uuidCacheIdentity(namespace, tenantID, model, seed string) string {
 		digest := sha256.Sum256([]byte("grok-go:client-key:" + tenantID))
 		tenantID = hex.EncodeToString(digest[:12])
 	}
-	digest := sha256.Sum256([]byte(namespace + ":" + tenantID + ":" + strings.ToLower(strings.TrimSpace(model)) + ":" + seed))
+	return scopedCacheIdentity(namespace, tenantID, model, seed)
+}
+
+func globalCacheIdentity(namespace, model, seed string) string {
+	return scopedCacheIdentity(namespace, "global", model, seed)
+}
+
+func scopedCacheIdentity(namespace, scope, model, seed string) string {
+	digest := sha256.Sum256([]byte(namespace + ":" + scope + ":" + strings.ToLower(strings.TrimSpace(model)) + ":" + seed))
 	value := digest[:16]
 	value[6] = (value[6] & 0x0f) | 0x50
 	value[8] = (value[8] & 0x3f) | 0x80

@@ -93,12 +93,12 @@ curl https://grok.example.com/v1/chat/completions \
 
 Chat Completions、Responses 和 Anthropic Messages 共用一条标准化事件管线。该管线
 保留 reasoning 增量、函数调用、usage、缓存输入 token、SSE 心跳以及各协议的终止
-事件结构。系统会生成两个稳定且租户隔离的标识：会话亲和键优先采用显式会话、
+事件结构。系统会生成两个稳定标识：租户隔离的会话亲和键优先采用显式会话、
 `prompt_cache_key`、metadata 或 Anthropic cache anchor，否则从稳定的对话前缀派生；
-上游 prompt-cache 键则从模型、system/instructions、developer 消息和 tools 等静态前缀
-派生，缺少静态前缀时才纳入首条 user 输入。会话亲和键用于保持兼容的上游账号；生成
-的 prompt-cache 键会发送给 CLI OAuth 和 Console SSO 路由，Grok SSO Web 私有协议不
-注入该字段。xAI 仍根据实际 prompt 前缀判定缓存命中。
+全局上游 prompt-cache 键则从模型、system/instructions、developer 消息和 tools 等静态
+前缀派生，不包含下游 API Key，缺少静态前缀时才纳入首条 user 输入。会话亲和键用于
+保持兼容的上游账号；生成的 prompt-cache 键会发送给 CLI OAuth 和 Console SSO 路由，
+Grok SSO Web 私有协议不注入该字段。xAI 仍根据实际 prompt 前缀判定缓存命中。
 
 图片生成通过 grok.com SSO 账号使用 Grok Imagine。图片编辑会先上传引用并创建 Grok
 所需的媒体帖子，然后以流式方式执行编辑。视频创建是异步的：生成期间始终固定到选中
@@ -331,14 +331,15 @@ Primary endpoints:
 Chat Completions, Responses, and Anthropic Messages share one normalized event
 pipeline. It preserves reasoning deltas, function calls, usage, cached-input
 tokens, SSE heartbeats, and each protocol's terminal event shape. GROK-GO
-derives two stable, tenant-isolated identities. The session-affinity key prefers
+derives two stable identities. The tenant-isolated session-affinity key prefers
 an explicit session, `prompt_cache_key`, metadata, or an Anthropic cache anchor,
 then falls back to a stable conversation prefix. A separate upstream
-prompt-cache key is derived from the static prefix: model, system/instructions,
-developer messages, and tools; the first user input is included only when no
-static prefix exists. The affinity key keeps requests on a compatible upstream
-account. The generated prompt-cache key is sent on CLI OAuth and Console SSO
-routes, but is not injected into the private Grok SSO Web schema. xAI still
+prompt-cache key is global across downstream API keys and derived from the
+static prefix: model, system/instructions, developer messages, and tools; the
+first user input is included only when no static prefix exists. The affinity key
+keeps requests on a compatible upstream account. The generated prompt-cache
+key is sent on CLI OAuth and Console SSO routes, but is not injected into the
+private Grok SSO Web schema. xAI still
 determines cache hits from the actual prompt prefix.
 
 Image generation uses Grok Imagine for grok.com SSO accounts. Image editing

@@ -22,13 +22,15 @@ upstream.
 
 Each enabled model declares its upstream model, credential kind, capability,
 minimum account tier, and whether the highest available tier is preferred.
-GROK-GO derives two tenant-isolated, UUID-shaped identities. The session
+GROK-GO derives two UUID-shaped identities. The tenant-isolated session
 affinity key prefers an explicit session header, `prompt_cache_key`, supported
 metadata session, or Anthropic cache anchor, and otherwise falls back to a
-stable conversation prefix. The upstream prompt-cache key is derived
+stable conversation prefix. The global upstream prompt-cache key is derived
 separately from the normalized static prefix: model, system/instructions,
-developer messages, and tools. When no static prefix exists, the first user
-input is included to avoid concentrating every request in one routing bucket.
+developer messages, and tools. It does not include the downstream API key, so
+matching prefixes share upstream cache routing across users. When no static
+prefix exists, the first user input is included to avoid concentrating every
+request in one routing bucket.
 
 CLI OAuth and Console SSO Responses requests receive the derived upstream key
 in `prompt_cache_key` and `X-Grok-Conv-Id`; client-provided raw values cannot
